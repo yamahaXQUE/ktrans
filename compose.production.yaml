@@ -1,0 +1,102 @@
+services:
+  app:
+    environment:
+      DATABASE_URL: ""
+      DATABASE_URL_FILE: /run/secrets/database_url
+      BITRIX_WEBHOOK_URL: ""
+      BITRIX_WEBHOOK_URL_FILE: /run/secrets/bitrix_webhook_url
+      BITRIX_CA_FILE: /run/secrets/corporate_ca
+      SESSION_COOKIE_SECURE: "true"
+    secrets:
+      - database_url
+      - bitrix_webhook_url
+      - corporate_ca
+
+  db:
+    environment:
+      POSTGRES_PASSWORD: ""
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  sync:
+    image: kulikov-call-tasks:${APP_IMAGE_TAG:-local}
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - backend.sync_daemon
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      BITRIX_WEBHOOK_URL_FILE: /run/secrets/bitrix_webhook_url
+      BITRIX_CA_FILE: /run/secrets/corporate_ca
+      BITRIX_TLS_COMPATIBILITY: "${BITRIX_TLS_COMPATIBILITY:-true}"
+      BITRIX_OPERATOR_DEPARTMENT_ID: "${BITRIX_OPERATOR_DEPARTMENT_ID:-82}"
+      BITRIX_SYNC_INTERVAL_SECONDS: "${BITRIX_SYNC_INTERVAL_SECONDS:-300}"
+      BITRIX_DIRECTORY_SYNC_INTERVAL_SECONDS: >-
+        ${BITRIX_DIRECTORY_SYNC_INTERVAL_SECONDS:-3600}
+      BITRIX_CALL_LOOKBACK_HOURS: "${BITRIX_CALL_LOOKBACK_HOURS:-48}"
+      BITRIX_SYNC_MAX_RECORDS_PER_OPERATOR: >-
+        ${BITRIX_SYNC_MAX_RECORDS_PER_OPERATOR:-1000}
+    secrets:
+      - database_url
+      - bitrix_webhook_url
+      - corporate_ca
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  analysis:
+    image: kulikov-call-tasks:${APP_IMAGE_TAG:-local}
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - backend.analysis_daemon
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      BITRIX_WEBHOOK_URL_FILE: /run/secrets/bitrix_webhook_url
+      BITRIX_CA_FILE: /run/secrets/corporate_ca
+      BITRIX_TLS_COMPATIBILITY: "${BITRIX_TLS_COMPATIBILITY:-true}"
+      OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      OPENAI_CA_FILE: /run/secrets/corporate_ca
+      OPENAI_TRANSCRIPTION_MODEL: >-
+        ${OPENAI_TRANSCRIPTION_MODEL:-gpt-4o-mini-transcribe}
+      OPENAI_TASK_MODEL: "${OPENAI_TASK_MODEL:-gpt-5.6-luna}"
+      ANALYSIS_POLL_INTERVAL_SECONDS: >-
+        ${ANALYSIS_POLL_INTERVAL_SECONDS:-60}
+      ANALYSIS_LOOKBACK_HOURS: "${ANALYSIS_LOOKBACK_HOURS:-24}"
+      ANALYSIS_MIN_DURATION_SECONDS: >-
+        ${ANALYSIS_MIN_DURATION_SECONDS:-10}
+      ANALYSIS_MAX_RECORDING_BYTES: >-
+        ${ANALYSIS_MAX_RECORDING_BYTES:-25000000}
+      ANALYSIS_STALE_PROCESSING_MINUTES: >-
+        ${ANALYSIS_STALE_PROCESSING_MINUTES:-30}
+      # Захарова Анастасия, Невечеря Светлана,
+      # Рустамова Ранохан, Лазаревич Регина.
+      ANALYSIS_AUTO_BITRIX_USER_IDS: >-
+        ${ANALYSIS_AUTO_BITRIX_USER_IDS:-43654,13,55520,10}
+    secrets:
+      - database_url
+      - bitrix_webhook_url
+      - corporate_ca
+      - openai_api_key
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+secrets:
+  database_url:
+    environment: KULIKOV_DATABASE_URL
+  bitrix_webhook_url:
+    environment: BITRIX_WEBHOOK_URL
+  corporate_ca:
+    environment: CORPORATE_CA_PEM
+  postgres_password:
+    environment: POSTGRES_PASSWORD
+  openai_api_key:
+    environment: OPENAI_API_KEY

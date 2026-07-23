@@ -1,0 +1,69 @@
+name: kulikov-call-tasks
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      secrets:
+        - source: npm_ca
+          target: corp_ca
+    image: kulikov-call-tasks:${APP_IMAGE_TAG:-local}
+    restart: unless-stopped
+    ports:
+      - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: >-
+        postgresql://${POSTGRES_USER:-call_tasks}:${POSTGRES_PASSWORD:-call_tasks_local}@db:5432/${POSTGRES_DB:-call_tasks}
+      BITRIX_WEBHOOK_URL: "${BITRIX_WEBHOOK_URL:-}"
+      BITRIX_TLS_COMPATIBILITY: "${BITRIX_TLS_COMPATIBILITY:-false}"
+      BITRIX_ALLOWED_PORTALS: "${BITRIX_ALLOWED_PORTALS:-bitrix.kulikov.com}"
+      BITRIX_OPERATOR_DEPARTMENT_ID: "${BITRIX_OPERATOR_DEPARTMENT_ID:-82}"
+      BITRIX_TASK_ENTITY_TYPE_ID: "${BITRIX_TASK_ENTITY_TYPE_ID:-1034}"
+      BITRIX_TASK_FIELD_MAPPING: '${BITRIX_TASK_FIELD_MAPPING:-{"title":"title"}}'
+      BITRIX_TASK_CONSTANT_FIELDS: '${BITRIX_TASK_CONSTANT_FIELDS:-{"opened":true}}'
+      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-true}"
+      DEV_BITRIX_USER_ID: "${DEV_BITRIX_USER_ID:-}"
+      DB_STARTUP_TIMEOUT: "${DB_STARTUP_TIMEOUT:-60}"
+      WEB_CONCURRENCY: "${WEB_CONCURRENCY:-1}"
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-*}"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          from urllib.request import urlopen;
+          urlopen('http://127.0.0.1:8080/health', timeout=2).read()
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-call_tasks}"
+      POSTGRES_USER: "${POSTGRES_USER:-call_tasks}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-call_tasks_local}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:
+
+secrets:
+  npm_ca:
+    file: "${NPM_CA_FILE:-deploy/no-corporate-ca.pem}"

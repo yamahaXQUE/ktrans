@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.py[cod]
+frontend/dist
+frontend/node_modules
+data
+tests

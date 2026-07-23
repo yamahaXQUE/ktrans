@@ -1,0 +1,8 @@
+services:
+  app:
+    environment:
+      # Temporary direct-browser access that behaves like an authenticated
+      # Bitrix iframe session. Remove this overlay to require BX24 auth again.
+      BITRIX_EMULATION_ENABLED: "true"
+      DEV_BITRIX_USER_ID: "${DEV_BITRIX_USER_ID:-10}"
+      SESSION_COOKIE_SECURE: "${EMULATION_COOKIE_SECURE:-false}"
