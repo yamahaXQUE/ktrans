@@ -102,6 +102,10 @@ export type TaskCandidate = {
   qualityCriterion: number | null;
   complaintBasis: ComplaintBasis;
   complaintEvidence: string;
+  /** null means the candidate predates the strict concrete-complaint gate. */
+  isConcreteComplaint: boolean | null;
+  complaintSubject: string;
+  complaintIssue: string;
   status: CandidateStatus;
   /** Set once confirmed and created in Bitrix. */
   bitrixTaskId: string | null;
@@ -140,10 +144,40 @@ export type ComplaintDepartmentStat = {
   sharePercent: number;
 };
 
+export type ComplaintTaskTypeStat = {
+  taskType: TaskType;
+  count: number;
+  sharePercent: number;
+};
+
+export type ComplaintDailyStat = {
+  day: string;
+  calls: number;
+  analyzedCalls: number;
+  analysisFailures: number;
+  complaintCandidates: number;
+  createdTasks: number;
+};
+
 export type ComplaintAnalytics = {
   totalComplaints: number;
+  totalCalls: number;
+  analyzedCalls: number;
+  analysisFailedCalls: number;
+  analysisPendingCalls: number;
+  manualQueueCalls: number;
+  complaintCandidates: number;
+  confirmedCandidates: number;
+  rejectedCandidates: number;
+  deliveryFailedTasks: number;
+  analysisCoveragePercent: number;
+  deliverySuccessPercent: number;
+  periodStart: string | null;
+  periodEnd: string | null;
   generatedAt: string;
   departments: ComplaintDepartmentStat[];
+  taskTypes: ComplaintTaskTypeStat[];
+  daily: ComplaintDailyStat[];
 };
 
 export type Dictionaries = {
@@ -154,6 +188,7 @@ export type Dictionaries = {
 export type ConfirmCandidatePayload = {
   taskName: string;
   taskDescription: string;
+  departmentId: number | null;
   department: string | null;
   priority: Priority;
 };

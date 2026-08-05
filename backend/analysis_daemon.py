@@ -16,9 +16,11 @@ from openai import OpenAI
 from backend.analysis_store import mark_transcription_failed, persist_call_analysis
 from backend.analyzer import (
     DEFAULT_TASK_MODEL,
+    DEFAULT_TRANSCRIPT_ENHANCEMENT_MODEL,
     DEFAULT_TRANSCRIPTION_MODEL,
     AnalyzeCall,
     AnalyzeText,
+    EnhanceTranscript,
 )
 from backend.db import connect
 from bitrix import BitrixClient
@@ -33,6 +35,7 @@ class AnalysisConfig:
     stale_processing_minutes: int
     automatic_bitrix_user_ids: tuple[int, ...]
     transcription_model: str
+    transcript_enhancement_model: str
     task_model: str
 
     @classmethod
@@ -61,6 +64,10 @@ class AnalysisConfig:
             transcription_model=os.getenv(
                 "OPENAI_TRANSCRIPTION_MODEL",
                 DEFAULT_TRANSCRIPTION_MODEL,
+            ).strip(),
+            transcript_enhancement_model=os.getenv(
+                "OPENAI_TRANSCRIPT_ENHANCEMENT_MODEL",
+                os.getenv("OPENAI_TASK_MODEL", DEFAULT_TRANSCRIPT_ENHANCEMENT_MODEL),
             ).strip(),
             task_model=os.getenv(
                 "OPENAI_TASK_MODEL",
@@ -111,9 +118,15 @@ def process_next_call(
                 client=openai_client,
                 model=config.transcription_model,
             )
-            transcript = transcriber.extract_text().strip()
-            if not transcript:
+            raw_transcript = transcriber.extract_text().strip()
+            if not raw_transcript:
                 raise RuntimeError("Transcription API returned empty text")
+
+            transcript, enhancement_error = _enhance_with_fallback(
+                raw_transcript,
+                client=transcriber.client,
+                model=config.transcript_enhancement_model,
+            )
 
             analyzer = AnalyzeText(
                 transcript,
@@ -129,6 +142,9 @@ def process_next_call(
                 connection,
                 call_id=job.call_id,
                 transcript=transcript,
+                raw_transcript=raw_transcript,
+                transcript_enhancement_model=config.transcript_enhancement_model,
+                transcript_enhancement_error=enhancement_error,
                 candidate=candidate,
                 prediction_model=config.task_model,
                 raw_prediction=_raw_prediction(candidate),
@@ -170,6 +186,7 @@ def main() -> None:
         {
             "analysis_worker": "started",
             "transcription_model": config.transcription_model,
+            "transcript_enhancement_model": config.transcript_enhancement_model,
             "task_model": config.task_model,
             "poll_interval_seconds": config.poll_interval_seconds,
             "lookback_hours": config.lookback_hours,
@@ -291,6 +308,9 @@ def _raw_prediction(candidate: Any) -> dict[str, Any]:
         "quality_criterion": candidate.quality_criterion,
         "complaint_basis": candidate.complaint_basis,
         "complaint_evidence": candidate.complaint_evidence,
+        "is_concrete_complaint": candidate.is_concrete_complaint,
+        "complaint_subject": candidate.complaint_subject,
+        "complaint_issue": candidate.complaint_issue,
         "requires_unstated_exact_data": candidate.requires_unstated_exact_data,
     }
 
@@ -298,6 +318,27 @@ def _raw_prediction(candidate: Any) -> dict[str, Any]:
 def _safe_error(exc: Exception) -> str:
     message = " ".join(str(exc).split())
     return f"{type(exc).__name__}: {message}"[:2000]
+
+
+def _enhance_with_fallback(
+    raw_transcript: str,
+    *,
+    client: OpenAI,
+    model: str,
+) -> tuple[str, str | None]:
+    """Enhance text without allowing this optional step to fail the job."""
+
+    try:
+        return (
+            EnhanceTranscript(
+                raw_transcript,
+                client=client,
+                model=model,
+            ).enhance(),
+            None,
+        )
+    except Exception as exc:
+        return raw_transcript, _safe_error(exc)
 
 
 def _positive_int(name: str, default: int) -> int:

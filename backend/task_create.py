@@ -39,6 +39,9 @@ class TaskCandidate:
     quality_criterion: int | None
     complaint_basis: str
     complaint_evidence: str
+    is_concrete_complaint: bool | None
+    complaint_subject: str
+    complaint_issue: str
     requires_unstated_exact_data: bool
 
     def __init__(
@@ -59,6 +62,9 @@ class TaskCandidate:
         quality_criterion: int | None = None,
         complaint_basis: str | None = None,
         complaint_evidence: str = "",
+        is_concrete_complaint: bool | None = None,
+        complaint_subject: str = "",
+        complaint_issue: str = "",
         requires_unstated_exact_data: bool = False,
     ) -> None:
         resolved_call_id = call_id if call_id is not None else task_id
@@ -87,6 +93,8 @@ class TaskCandidate:
             "legacy" if should_create else "none"
         )
         cleaned_complaint_evidence = complaint_evidence.strip()
+        cleaned_complaint_subject = complaint_subject.strip()
+        cleaned_complaint_issue = complaint_issue.strip()
         if resolved_task_type not in ALLOWED_TASK_TYPES:
             raise ValueError(f"unsupported task_type: {resolved_task_type}")
         if resolved_complaint_basis not in {
@@ -97,6 +105,19 @@ class TaskCandidate:
         }:
             raise ValueError(
                 f"unsupported complaint_basis: {resolved_complaint_basis}"
+            )
+        if is_concrete_complaint is True:
+            if resolved_complaint_basis != "explicit_complaint":
+                raise ValueError(
+                    "a concrete complaint requires explicit_complaint"
+                )
+            if not cleaned_complaint_subject or not cleaned_complaint_issue:
+                raise ValueError(
+                    "a concrete complaint requires a subject and issue"
+                )
+        elif cleaned_complaint_subject or cleaned_complaint_issue:
+            raise ValueError(
+                "non-concrete feedback requires empty complaint subject and issue"
             )
         if resolved_task_type == "none" and should_create:
             raise ValueError("task_type=none requires should_create=false")
@@ -134,11 +155,16 @@ class TaskCandidate:
                     "an explicit complaint basis requires complaint evidence"
                 )
         elif resolved_task_type != "legacy":
-            if resolved_complaint_basis not in {
-                "explicit_complaint",
-                "explicit_negative_feedback",
-            }:
-                raise ValueError("classified tasks require an explicit complaint")
+            if resolved_complaint_basis != "explicit_complaint":
+                raise ValueError(
+                    "classified tasks require an explicit concrete complaint"
+                )
+            if is_concrete_complaint is not True:
+                raise ValueError("classified tasks require a concrete complaint")
+            if not cleaned_complaint_subject or not cleaned_complaint_issue:
+                raise ValueError(
+                    "classified tasks require a complaint subject and issue"
+                )
             if not cleaned_complaint_evidence:
                 raise ValueError("classified tasks require complaint evidence")
             if requires_unstated_exact_data:
@@ -166,6 +192,17 @@ class TaskCandidate:
             "complaint_evidence",
             cleaned_complaint_evidence,
         )
+        object.__setattr__(
+            self,
+            "is_concrete_complaint",
+            is_concrete_complaint,
+        )
+        object.__setattr__(
+            self,
+            "complaint_subject",
+            cleaned_complaint_subject,
+        )
+        object.__setattr__(self, "complaint_issue", cleaned_complaint_issue)
         object.__setattr__(
             self,
             "requires_unstated_exact_data",

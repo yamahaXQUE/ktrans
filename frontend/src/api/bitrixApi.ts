@@ -5,8 +5,8 @@
 // returns a SessionUser whose `role` it resolved server-side (department head
 // / supervisor allowlist). Nothing sensitive is decided on the client.
 //
-// Returns null when we are not inside a Bitrix iframe or the handshake fails;
-// the caller then falls back to backend-dev or mock mode.
+// Returns null only when the page is not inside a Bitrix iframe. Handshake and
+// backend errors are surfaced so production never impersonates a mock user.
 
 import type { SessionUser } from "../types/domain";
 
@@ -97,29 +97,50 @@ export async function initBitrixSession(): Promise<SessionUser | null> {
     return null;
   }
 
-  return new Promise((resolve) => {
-    const timeout = window.setTimeout(() => resolve(null), 2500);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout = 0;
+    const succeed = (profile: SessionUser) => {
+      if (!settled) {
+        settled = true;
+        window.clearTimeout(timeout);
+        resolve(profile);
+      }
+    };
+    const fail = (error: unknown) => {
+      if (!settled) {
+        settled = true;
+        window.clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    timeout = window.setTimeout(
+      () => fail(new Error("Bitrix24 не ответил при авторизации")),
+      8000,
+    );
 
     try {
       window.BX24?.init(() => {
         const auth = window.BX24?.getAuth();
         if (!auth) {
-          window.clearTimeout(timeout);
-          resolve(null);
+          fail(new Error("Bitrix24 не передал данные авторизации"));
           return;
         }
 
         window.BX24?.callMethod("user.current", {}, (result) => {
-          const user = result.error() ? null : result.data();
+          const bitrixError = result.error();
+          if (bitrixError) {
+            fail(new Error(`Bitrix24 отклонил user.current: ${String(bitrixError)}`));
+            return;
+          }
+          const user = result.data();
           syncBitrixSession(auth, user)
-            .then((profile) => resolve(profile))
-            .catch(() => resolve(null))
-            .finally(() => window.clearTimeout(timeout));
+            .then(succeed)
+            .catch(fail);
         });
       });
-    } catch {
-      window.clearTimeout(timeout);
-      resolve(null);
+    } catch (error) {
+      fail(error);
     }
   });
 }

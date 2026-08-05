@@ -11,10 +11,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from backend.bitrix_app import router as bitrix_app_router
 from backend.router import router
 
 
 app = FastAPI(title="Kulikov call tasks", version="0.1.0")
+app.include_router(bitrix_app_router)
 app.include_router(router)
 
 

@@ -28,7 +28,7 @@ Core ownership:
 | `task_candidates` | immutable model prediction |
 | `candidate_reviews` | current operator decision |
 | `confirmed_tasks` | operator-edited entity sent to Bitrix |
-| `bitrix_task_attempts` | every `crm.item.add` attempt |
+| `bitrix_task_attempts` | every Bitrix task delivery attempt |
 | `user_sessions` | server-side iframe sessions |
 
 The `candidate_feed` and `operator_dashboard` views are frontend read models;
@@ -48,4 +48,17 @@ Migration `0006_operator_call_workspace.sql` adds the always-present
 conversation title, deletion tombstones, and cascading removal of local task
 history. Migration `0007_operator_decides_task.sql` allows the model to report
 a complaint without recommending a task; the operator remains the final
-decision-maker.
+decision-maker. Migration `0008_native_bitrix_tasks.sql` preserves prior CRM
+delivery history and switches new confirmations to native Bitrix tasks with an
+audited responsible user. Migration `0009_onpremise_task_method.sql` selects
+the legacy-compatible `task.item.add` exposed by the current portal while
+retaining support for `tasks.task.add`.
+
+Migration `0010_readable_transcripts.sql` preserves the raw ASR result and
+stores a separately enhanced, human-readable transcript plus enhancement
+model, timestamp, and non-fatal error metadata.
+
+Migration `0011_concrete_complaint_gate.sql` adds an auditable strict gate:
+new Bitrix tasks require a specific customer complaint subject and a specific
+failure, defect, or negative incident. Earlier candidates stay readable for
+history but are not treated as newly deliverable concrete complaints.

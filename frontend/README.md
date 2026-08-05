@@ -80,8 +80,10 @@ PATCH /api/candidates/{id}/reject     -> TaskCandidate     # body: { reason: str
 ```
 
 - `confirm` — создать `ConfirmedTask` из (отредактированного) кандидата и
-  записать задачу в Bitrix (`crm.item.add`). При успехе вернуть кандидата со
-  статусом `confirmed` и `bitrixTaskId`.
+  записать обычную задачу в Bitrix (`task.item.add` на текущем портале).
+  Ответственный —
+  руководитель выбранного подразделения, подтвердивший оператор — наблюдатель.
+  При успехе вернуть кандидата со статусом `confirmed` и `bitrixTaskId`.
 - `retry` — повторить создание для `failed`-кандидата с учётом правок оператора.
 - `reject` — записать `RejectedTaskCandidate`, статус `rejected`.
 - Если создание в Bitrix упало — вернуть статус `failed` и `failureReason`.

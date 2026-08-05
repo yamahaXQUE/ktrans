@@ -5,9 +5,8 @@ from bitrix.bit import (
     BitrixClient,
     BitrixError,
     BitrixResponse,
-    BitrixTaskMapper,
     BitrixTransportError,
-    CrmItemAddResult,
+    TaskAddResult,
 )
 from bitrix.mirror import (
     BitrixCall,
@@ -26,8 +25,7 @@ __all__ = [
     "BitrixError",
     "BitrixMirror",
     "BitrixResponse",
-    "BitrixTaskMapper",
     "BitrixTransportError",
     "BitrixUser",
-    "CrmItemAddResult",
+    "TaskAddResult",
 ]

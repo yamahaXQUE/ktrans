@@ -195,6 +195,9 @@ const mockCandidateSeeds: Array<
     | "qualityCriterion"
     | "complaintBasis"
     | "complaintEvidence"
+    | "isConcreteComplaint"
+    | "complaintSubject"
+    | "complaintIssue"
   >
 > = [
   {
@@ -359,6 +362,9 @@ export const mockCandidates: TaskCandidate[] = mockCandidateSeeds.map(
     complaintEvidence: candidate.shouldCreate
       ? "Клиент явно сообщил о жалобе."
       : "",
+    isConcreteComplaint: candidate.shouldCreate,
+    complaintSubject: candidate.shouldCreate ? candidate.taskName : "",
+    complaintIssue: candidate.shouldCreate ? candidate.taskDescription : "",
   }),
 );
 

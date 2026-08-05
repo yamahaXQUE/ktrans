@@ -18,6 +18,9 @@ def persist_call_analysis(
     *,
     call_id: UUID,
     transcript: str,
+    raw_transcript: str | None = None,
+    transcript_enhancement_model: str | None = None,
+    transcript_enhancement_error: str | None = None,
     candidate: TaskCandidate,
     prediction_model: str,
     raw_prediction: dict[str, Any] | None = None,
@@ -25,8 +28,11 @@ def persist_call_analysis(
     """Atomically store call text and one immutable prediction for the call."""
 
     cleaned_transcript = transcript.strip()
+    cleaned_raw_transcript = (raw_transcript or transcript).strip()
     if not cleaned_transcript:
         raise ValueError("transcript cannot be empty")
+    if not cleaned_raw_transcript:
+        raise ValueError("raw_transcript cannot be empty")
     if not prediction_model.strip():
         raise ValueError("prediction_model cannot be empty")
     if str(candidate.call_id) != str(call_id):
@@ -38,13 +44,27 @@ def persist_call_analysis(
             UPDATE calls
             SET
                 transcript = %s,
+                raw_transcript = %s,
+                transcript_enhancement_model = %s,
+                transcript_enhancement_error = %s,
+                transcript_enhanced_at = CASE
+                    WHEN %s::text IS NULL THEN now()
+                    ELSE NULL
+                END,
                 transcription_status = 'completed',
                 transcription_error = NULL,
                 transcribed_at = now()
             WHERE id = %s
             RETURNING operator_id
             """,
-            (cleaned_transcript, call_id),
+            (
+                cleaned_transcript,
+                cleaned_raw_transcript,
+                transcript_enhancement_model,
+                transcript_enhancement_error,
+                transcript_enhancement_error,
+                call_id,
+            ),
         ).fetchone()
         if call_row is None:
             raise NotFoundError(f"Call {call_id} not found")
@@ -81,12 +101,16 @@ def persist_call_analysis(
                 quality_criterion,
                 complaint_basis,
                 complaint_evidence,
+                is_concrete_complaint,
+                complaint_subject,
+                complaint_issue,
                 prediction_model,
                 raw_prediction
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s
             )
             ON CONFLICT (call_id) DO NOTHING
             RETURNING id
@@ -105,6 +129,9 @@ def persist_call_analysis(
                 candidate.quality_criterion,
                 candidate.complaint_basis,
                 candidate.complaint_evidence,
+                candidate.is_concrete_complaint,
+                candidate.complaint_subject,
+                candidate.complaint_issue,
                 prediction_model.strip(),
                 Jsonb(raw_prediction or {}),
             ),

@@ -11,7 +11,9 @@ from psycopg.types.json import Jsonb
 
 from backend.schemas import (
     ComplaintAnalyticsDto,
+    ComplaintDailyStatDto,
     ComplaintDepartmentStatDto,
+    ComplaintTaskTypeStatDto,
     ConfirmCandidatePayload,
     DepartmentDto,
     OperatorSummaryDto,
@@ -65,6 +67,39 @@ def get_operator_by_bitrix_user_id(
     return _session_user(row, source="bitrix")
 
 
+def upsert_bypass_supervisor(
+    connection: Connection,
+    *,
+    bitrix_user_id: int,
+    display_name: str,
+    work_position: str,
+) -> SessionUserDto:
+    """Create the explicitly allowlisted portal viewer as an app supervisor."""
+
+    row = connection.execute(
+        """
+        INSERT INTO operators (
+            bitrix_user_id,
+            display_name,
+            work_position,
+            active,
+            role,
+            synced_at
+        )
+        VALUES (%s, %s, %s, true, 'supervisor', now())
+        ON CONFLICT (bitrix_user_id) DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            work_position = EXCLUDED.work_position,
+            active = true,
+            role = 'supervisor',
+            synced_at = now()
+        RETURNING id
+        """,
+        (bitrix_user_id, display_name, work_position),
+    ).fetchone()
+    return get_operator_by_id(connection, row["id"], source="bitrix")
+
+
 def get_operator_by_id(
     connection: Connection,
     operator_id: UUID,
@@ -113,6 +148,101 @@ def get_operator_bitrix_user_id(
     if row is None:
         raise NotFoundError(f"Operator {operator_id} not found")
     return int(row["bitrix_user_id"])
+
+
+def resolve_task_destination(
+    connection: Connection,
+    *,
+    department_id: int | None,
+    department_label: str | None,
+    default_department_id: int,
+) -> dict[str, Any]:
+    """Resolve the canonical department and nearest responsible department head."""
+
+    if department_id is not None:
+        origin = connection.execute(
+            """
+            SELECT bitrix_department_id, name
+            FROM departments
+            WHERE bitrix_department_id = %s
+              AND active
+            """,
+            (department_id,),
+        ).fetchone()
+    elif department_label:
+        origin = connection.execute(
+            """
+            SELECT bitrix_department_id, name
+            FROM departments
+            WHERE lower(name) = lower(%s)
+              AND active
+            ORDER BY bitrix_department_id
+            LIMIT 1
+            """,
+            (department_label,),
+        ).fetchone()
+    else:
+        origin = connection.execute(
+            """
+            SELECT bitrix_department_id, name
+            FROM departments
+            WHERE bitrix_department_id = %s
+              AND active
+            """,
+            (default_department_id,),
+        ).fetchone()
+
+    if origin is None:
+        requested = department_id or department_label or default_department_id
+        raise ConflictError(
+            f"Department {requested!r} is unavailable in the Bitrix directory"
+        )
+
+    responsible = connection.execute(
+        """
+        WITH RECURSIVE department_chain AS (
+            SELECT
+                bitrix_department_id,
+                parent_bitrix_department_id,
+                head_bitrix_user_id,
+                0 AS depth
+            FROM departments
+            WHERE bitrix_department_id = %s
+              AND active
+
+            UNION ALL
+
+            SELECT
+                parent.bitrix_department_id,
+                parent.parent_bitrix_department_id,
+                parent.head_bitrix_user_id,
+                child.depth + 1
+            FROM departments AS parent
+            JOIN department_chain AS child
+              ON parent.bitrix_department_id = child.parent_bitrix_department_id
+            WHERE parent.active
+              AND child.depth < 50
+        )
+        SELECT head_bitrix_user_id
+        FROM department_chain
+        WHERE head_bitrix_user_id IS NOT NULL
+        ORDER BY depth
+        LIMIT 1
+        """,
+        (origin["bitrix_department_id"],),
+    ).fetchone()
+    if responsible is None:
+        raise ConflictError(
+            f"Department {origin['name']!r} and its parents have no Bitrix head"
+        )
+
+    return {
+        "department_id": int(origin["bitrix_department_id"]),
+        "department": origin["name"],
+        "responsible_bitrix_user_id": int(
+            responsible["head_bitrix_user_id"]
+        ),
+    }
 
 
 def create_session(
@@ -210,8 +340,13 @@ def list_operator_summaries(
 ) -> list[OperatorSummaryDto]:
     rows = connection.execute(
         """
-        SELECT *
-        FROM operator_dashboard
+        SELECT dashboard.*
+        FROM operator_dashboard AS dashboard
+        WHERE EXISTS (
+            SELECT 1
+            FROM operator_departments AS membership
+            WHERE membership.operator_id = dashboard.id
+        )
         ORDER BY lower(display_name), id
         """
     ).fetchall()
@@ -227,7 +362,7 @@ def list_operator_summaries(
 def get_complaint_analytics(
     connection: Connection,
 ) -> ComplaintAnalyticsDto:
-    rows = connection.execute(
+    department_rows = connection.execute(
         """
         SELECT
             COALESCE(
@@ -257,7 +392,7 @@ def get_complaint_analytics(
         )
         """
     ).fetchall()
-    total = sum(int(row["complaint_count"]) for row in rows)
+    total = sum(int(row["complaint_count"]) for row in department_rows)
     departments = [
         ComplaintDepartmentStatDto(
             department=row["department"],
@@ -268,12 +403,162 @@ def get_complaint_analytics(
                 else 0
             ),
         )
-        for row in rows
+        for row in department_rows
     ]
+
+    call_stats = connection.execute(
+        """
+        SELECT
+            count(*)::integer AS total_calls,
+            count(*) FILTER (
+                WHERE transcription_status = 'completed'
+            )::integer AS analyzed_calls,
+            count(*) FILTER (
+                WHERE transcription_status = 'failed'
+            )::integer AS analysis_failed_calls,
+            count(*) FILTER (
+                WHERE transcription_status IN ('pending', 'processing')
+            )::integer AS analysis_pending_calls,
+            count(*) FILTER (
+                WHERE analysis_requested_at IS NOT NULL
+                  AND transcription_status IN ('pending', 'processing')
+            )::integer AS manual_queue_calls,
+            min(started_at) AS period_start,
+            max(started_at) AS period_end
+        FROM calls
+        """
+    ).fetchone()
+    candidate_stats = connection.execute(
+        """
+        SELECT
+            count(*) FILTER (
+                WHERE candidate.complaint_basis IN (
+                    'explicit_complaint',
+                    'explicit_negative_feedback'
+                )
+            )::integer AS complaint_candidates,
+            count(*) FILTER (
+                WHERE candidate.complaint_basis IN (
+                    'explicit_complaint',
+                    'explicit_negative_feedback'
+                )
+                  AND review.decision = 'confirmed'
+            )::integer AS confirmed_candidates,
+            count(*) FILTER (
+                WHERE candidate.complaint_basis IN (
+                    'explicit_complaint',
+                    'explicit_negative_feedback'
+                )
+                  AND review.decision = 'rejected'
+            )::integer AS rejected_candidates,
+            count(*) FILTER (
+                WHERE candidate.complaint_basis IN (
+                    'explicit_complaint',
+                    'explicit_negative_feedback'
+                )
+                  AND task.delivery_status = 'failed'
+            )::integer AS delivery_failed_tasks
+        FROM task_candidates AS candidate
+        LEFT JOIN candidate_reviews AS review
+            ON review.candidate_id = candidate.id
+        LEFT JOIN confirmed_tasks AS task
+            ON task.candidate_id = candidate.id
+        """
+    ).fetchone()
+    task_type_rows = connection.execute(
+        """
+        SELECT task_type, count(*)::integer AS complaint_count
+        FROM task_candidates
+        WHERE complaint_basis IN (
+            'explicit_complaint',
+            'explicit_negative_feedback'
+        )
+        GROUP BY task_type
+        ORDER BY complaint_count DESC, task_type
+        """
+    ).fetchall()
+    complaint_candidate_total = int(candidate_stats["complaint_candidates"])
+    task_types = [
+        ComplaintTaskTypeStatDto(
+            task_type=row["task_type"],
+            count=int(row["complaint_count"]),
+            share_percent=(
+                round(int(row["complaint_count"]) * 100 / complaint_candidate_total, 1)
+                if complaint_candidate_total
+                else 0
+            ),
+        )
+        for row in task_type_rows
+    ]
+    daily_rows = connection.execute(
+        """
+        WITH latest AS (
+            SELECT max(started_at)::date AS last_day
+            FROM calls
+        )
+        SELECT
+            call.started_at::date AS day,
+            count(*)::integer AS calls,
+            count(*) FILTER (
+                WHERE call.transcription_status = 'completed'
+            )::integer AS analyzed_calls,
+            count(*) FILTER (
+                WHERE call.transcription_status = 'failed'
+            )::integer AS analysis_failures,
+            count(candidate.id) FILTER (
+                WHERE candidate.complaint_basis IN (
+                    'explicit_complaint',
+                    'explicit_negative_feedback'
+                )
+            )::integer AS complaint_candidates,
+            count(task.id) FILTER (
+                WHERE candidate.complaint_basis IN (
+                    'explicit_complaint',
+                    'explicit_negative_feedback'
+                )
+                  AND task.delivery_status = 'created'
+            )::integer AS created_tasks
+        FROM calls AS call
+        CROSS JOIN latest
+        LEFT JOIN task_candidates AS candidate
+            ON candidate.call_id = call.id
+        LEFT JOIN confirmed_tasks AS task
+            ON task.candidate_id = candidate.id
+        WHERE latest.last_day IS NOT NULL
+          AND call.started_at::date >= latest.last_day - 29
+        GROUP BY call.started_at::date
+        ORDER BY day
+        """
+    ).fetchall()
+    daily = [ComplaintDailyStatDto.model_validate(row) for row in daily_rows]
+    total_calls = int(call_stats["total_calls"])
+    analyzed_calls = int(call_stats["analyzed_calls"])
+    confirmed_candidates = int(candidate_stats["confirmed_candidates"])
     return ComplaintAnalyticsDto(
         total_complaints=total,
+        total_calls=total_calls,
+        analyzed_calls=analyzed_calls,
+        analysis_failed_calls=int(call_stats["analysis_failed_calls"]),
+        analysis_pending_calls=int(call_stats["analysis_pending_calls"]),
+        manual_queue_calls=int(call_stats["manual_queue_calls"]),
+        complaint_candidates=complaint_candidate_total,
+        confirmed_candidates=confirmed_candidates,
+        rejected_candidates=int(candidate_stats["rejected_candidates"]),
+        delivery_failed_tasks=int(candidate_stats["delivery_failed_tasks"]),
+        analysis_coverage_percent=(
+            round(analyzed_calls * 100 / total_calls, 1) if total_calls else 0
+        ),
+        delivery_success_percent=(
+            round(total * 100 / confirmed_candidates, 1)
+            if confirmed_candidates
+            else 0
+        ),
+        period_start=call_stats["period_start"],
+        period_end=call_stats["period_end"],
         generated_at=datetime.now(timezone.utc),
         departments=departments,
+        task_types=task_types,
+        daily=daily,
     )
 
 
@@ -283,35 +568,51 @@ def list_complaint_export_rows(
     return connection.execute(
         """
         SELECT
-            task.updated_at AS sent_at,
+            call.started_at AS call_started_at,
+            candidate.created_at AS analyzed_at,
+            CASE
+                WHEN task.delivery_status = 'created' THEN task.updated_at
+                ELSE NULL
+            END AS sent_at,
             task.bitrix_item_id,
             operator.display_name AS operator_name,
             COALESCE(
                 NULLIF(btrim(task.department_label), ''),
                 department.name,
+                predicted_department.name,
+                NULLIF(btrim(candidate.predicted_department), ''),
                 'Без отдела'
             ) AS department,
             candidate.task_type,
             candidate.complaint_basis,
             candidate.complaint_evidence,
-            task.title,
-            task.description,
-            task.priority,
+            candidate.should_create,
+            review.decision::text AS review_decision,
+            task.delivery_status::text AS delivery_status,
+            COALESCE(task.title, candidate.task_name) AS title,
+            COALESCE(task.description, candidate.task_description) AS description,
+            COALESCE(task.priority, candidate.priority) AS priority,
+            task.failure_reason,
             candidate.call_id
-        FROM confirmed_tasks AS task
-        JOIN task_candidates AS candidate
-            ON candidate.id = task.candidate_id
+        FROM task_candidates AS candidate
+        JOIN calls AS call
+            ON call.id = candidate.call_id
         JOIN operators AS operator
             ON operator.id = candidate.operator_id
+        LEFT JOIN candidate_reviews AS review
+            ON review.candidate_id = candidate.id
+        LEFT JOIN confirmed_tasks AS task
+            ON task.candidate_id = candidate.id
         LEFT JOIN departments AS department
             ON department.bitrix_department_id = task.department_id
-        WHERE task.delivery_status = 'created'
-          AND task.bitrix_item_id IS NOT NULL
-          AND candidate.complaint_basis IN (
+        LEFT JOIN departments AS predicted_department
+            ON predicted_department.bitrix_department_id =
+               candidate.predicted_department_id
+        WHERE candidate.complaint_basis IN (
               'explicit_complaint',
               'explicit_negative_feedback'
           )
-        ORDER BY task.updated_at DESC, task.id
+        ORDER BY candidate.created_at DESC, candidate.id
         """
     ).fetchall()
 
@@ -481,7 +782,12 @@ def list_candidates(
     operator_id: UUID | None = None,
 ) -> list[TaskCandidateDto]:
     params: tuple[Any, ...] = ()
-    conditions: list[str] = []
+    conditions: list[str] = [
+        "("
+        "feed.status IN ('confirmed', 'rejected') "
+        "OR (feed.should_create AND feed.is_concrete_complaint IS TRUE)"
+        ")"
+    ]
     if operator_id is not None:
         conditions.append("feed.operator_id = %s")
         params = (operator_id,)
@@ -574,7 +880,10 @@ def prepare_confirmed_task(
     candidate_id: UUID,
     actor: SessionUserDto,
     payload: ConfirmCandidatePayload,
-    entity_type_id: int,
+    department_id: int,
+    department_label: str,
+    responsible_bitrix_user_id: int,
+    bitrix_method: str,
     retry: bool,
 ) -> dict[str, Any]:
     _assert_candidate_access(
@@ -589,20 +898,6 @@ def prepare_confirmed_task(
             f"Candidate must be {expected} for this operation, got {candidate.status}"
         )
 
-    department_row = None
-    if payload.department:
-        department_row = connection.execute(
-            """
-            SELECT bitrix_department_id
-            FROM departments
-            WHERE lower(name) = lower(%s)
-              AND active
-            ORDER BY bitrix_department_id
-            LIMIT 1
-            """,
-            (payload.department,),
-        ).fetchone()
-
     with connection.transaction():
         if retry:
             row = connection.execute(
@@ -615,6 +910,9 @@ def prepare_confirmed_task(
                     department_id = %s,
                     department_label = %s,
                     priority = %s,
+                    bitrix_method = %s,
+                    bitrix_entity_type_id = NULL,
+                    responsible_bitrix_user_id = %s,
                     delivery_status = 'pending',
                     bitrix_item_id = NULL,
                     failure_reason = NULL
@@ -625,13 +923,11 @@ def prepare_confirmed_task(
                     actor.id,
                     payload.task_name.strip(),
                     payload.task_description.strip(),
-                    (
-                        department_row["bitrix_department_id"]
-                        if department_row
-                        else None
-                    ),
-                    payload.department,
+                    department_id,
+                    department_label,
                     payload.priority,
+                    bitrix_method,
+                    responsible_bitrix_user_id,
                     candidate_id,
                 ),
             ).fetchone()
@@ -659,9 +955,10 @@ def prepare_confirmed_task(
                     department_id,
                     department_label,
                     priority,
-                    bitrix_entity_type_id
+                    bitrix_method,
+                    responsible_bitrix_user_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -669,14 +966,11 @@ def prepare_confirmed_task(
                     actor.id,
                     payload.task_name.strip(),
                     payload.task_description.strip(),
-                    (
-                        department_row["bitrix_department_id"]
-                        if department_row
-                        else None
-                    ),
-                    payload.department,
+                    department_id,
+                    department_label,
                     payload.priority,
-                    entity_type_id,
+                    bitrix_method,
+                    responsible_bitrix_user_id,
                 ),
             ).fetchone()
 
@@ -686,9 +980,10 @@ def prepare_confirmed_task(
         "call_id": candidate.call_id,
         "title": payload.task_name.strip(),
         "description": payload.task_description.strip(),
-        "department": payload.department,
+        "department": department_label,
         "priority": payload.priority,
         "initiator_operator_id": actor.id,
+        "responsible_bitrix_user_id": responsible_bitrix_user_id,
     }
 
 
@@ -822,6 +1117,9 @@ def _candidate(row: dict[str, Any]) -> TaskCandidateDto:
         quality_criterion=row["quality_criterion"],
         complaint_basis=row["complaint_basis"],
         complaint_evidence=row["complaint_evidence"],
+        is_concrete_complaint=row["is_concrete_complaint"],
+        complaint_subject=row["complaint_subject"],
+        complaint_issue=row["complaint_issue"],
         status=row["status"],
         bitrix_task_id=row["bitrix_item_id"],
         failure_reason=row["failure_reason"],
@@ -893,7 +1191,9 @@ __all__ = [
     "list_departments",
     "list_emulation_users",
     "list_operator_summaries",
+    "upsert_bypass_supervisor",
     "prepare_confirmed_task",
     "request_call_analysis",
     "reject_candidate",
+    "resolve_task_destination",
 ]

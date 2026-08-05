@@ -1,76 +1,68 @@
-"""Turn an operator-approved entity into portal-specific ``crm.item.add``."""
+"""Turn an operator-approved entity into a native Bitrix task."""
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
-from typing import Any
 from uuid import UUID
 
 from psycopg import Connection
 
 from backend.repository import (
+    ConflictError,
     finish_task_attempt,
     get_candidate,
     get_operator_bitrix_user_id,
     prepare_confirmed_task,
+    resolve_task_destination,
 )
 from backend.schemas import (
     ConfirmCandidatePayload,
     SessionUserDto,
     TaskCandidateDto,
 )
-from backend.task_create import ConfirmedTask
-from bitrix import BitrixAPIError, BitrixClient, BitrixError, BitrixTaskMapper
+from bitrix import BitrixAPIError, BitrixClient, BitrixError
 
 
-DEFAULT_TASK_ENTITY_TYPE_ID = 1034
-DEFAULT_FIELD_MAPPING = {"title": "title"}
-DEFAULT_CONSTANT_FIELDS = {"opened": True}
+DEFAULT_TASK_DEPARTMENT_ID = 82
+DEFAULT_TASK_ADD_METHOD = "task.item.add"
 
 
 @dataclass(frozen=True, slots=True)
 class TaskDeliveryConfig:
-    entity_type_id: int
-    mapper: BitrixTaskMapper
+    default_department_id: int
+    add_method: str
 
     @classmethod
     def from_env(cls) -> "TaskDeliveryConfig":
-        raw_entity_type_id = os.getenv(
-            "BITRIX_TASK_ENTITY_TYPE_ID",
-            str(DEFAULT_TASK_ENTITY_TYPE_ID),
+        raw_department_id = os.getenv(
+            "BITRIX_TASK_DEFAULT_DEPARTMENT_ID",
+            os.getenv(
+                "BITRIX_OPERATOR_DEPARTMENT_ID",
+                str(DEFAULT_TASK_DEPARTMENT_ID),
+            ),
         )
         try:
-            entity_type_id = int(raw_entity_type_id)
+            department_id = int(raw_department_id)
         except ValueError as exc:
             raise RuntimeError(
-                "BITRIX_TASK_ENTITY_TYPE_ID must be an integer"
+                "BITRIX_TASK_DEFAULT_DEPARTMENT_ID must be an integer"
             ) from exc
-        if entity_type_id <= 0:
-            raise RuntimeError("BITRIX_TASK_ENTITY_TYPE_ID must be positive")
-
-        mapping = _json_object_env(
-            "BITRIX_TASK_FIELD_MAPPING",
-            DEFAULT_FIELD_MAPPING,
-        )
-        constants = _json_object_env(
-            "BITRIX_TASK_CONSTANT_FIELDS",
-            DEFAULT_CONSTANT_FIELDS,
-        )
-        if not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in mapping.items()
-        ):
+        if department_id <= 0:
             raise RuntimeError(
-                "BITRIX_TASK_FIELD_MAPPING must map strings to strings"
+                "BITRIX_TASK_DEFAULT_DEPARTMENT_ID must be positive"
+            )
+        add_method = os.getenv(
+            "BITRIX_TASK_ADD_METHOD",
+            DEFAULT_TASK_ADD_METHOD,
+        ).strip()
+        if add_method not in {"task.item.add", "tasks.task.add"}:
+            raise RuntimeError(
+                "BITRIX_TASK_ADD_METHOD must be task.item.add or tasks.task.add"
             )
         return cls(
-            entity_type_id=entity_type_id,
-            mapper=BitrixTaskMapper(
-                mapping,
-                constant_fields=constants,
-            ),
+            default_department_id=department_id,
+            add_method=add_method,
         )
 
 
@@ -84,37 +76,50 @@ def deliver_candidate(
     client: BitrixClient | None = None,
     config: TaskDeliveryConfig | None = None,
 ) -> TaskCandidateDto:
-    """Persist the edited task, attempt Bitrix delivery, and return feed state."""
+    """Persist the edited task, route it, attempt delivery, and return state."""
 
     resolved_config = config or TaskDeliveryConfig.from_env()
+    candidate = get_candidate(connection, candidate_id)
+    _require_concrete_complaint(candidate)
+    destination = resolve_task_destination(
+        connection,
+        department_id=payload.department_id,
+        department_label=payload.department,
+        default_department_id=resolved_config.default_department_id,
+    )
     task_row = prepare_confirmed_task(
         connection,
         candidate_id=candidate_id,
         actor=actor,
         payload=payload,
-        entity_type_id=resolved_config.entity_type_id,
+        department_id=destination["department_id"],
+        department_label=destination["department"],
+        responsible_bitrix_user_id=destination[
+            "responsible_bitrix_user_id"
+        ],
+        bitrix_method=resolved_config.add_method,
         retry=retry,
     )
     initiator_bitrix_id = get_operator_bitrix_user_id(connection, actor.id)
-    task = ConfirmedTask(
-        source_call_id=str(task_row["call_id"]),
-        title=task_row["title"],
-        description=task_row["description"],
-        department=task_row["department"],
-        initiator=initiator_bitrix_id,
-        priority=task_row["priority"],
-    )
-    fields = resolved_config.mapper.to_bitrix_fields(task)
+    responsible_bitrix_id = task_row["responsible_bitrix_user_id"]
+    fields = {
+        "TITLE": task_row["title"],
+        "DESCRIPTION": _task_description(task_row),
+        "RESPONSIBLE_ID": responsible_bitrix_id,
+        "PRIORITY": _bitrix_priority(task_row["priority"]),
+    }
+    if initiator_bitrix_id != responsible_bitrix_id:
+        fields["AUDITORS"] = [initiator_bitrix_id]
     request_payload = {
-        "entityTypeId": resolved_config.entity_type_id,
+        "method": resolved_config.add_method,
         "fields": fields,
     }
 
     resolved_client = client or BitrixClient.from_env()
     try:
-        result = resolved_client.crm_item_add(
-            entity_type_id=resolved_config.entity_type_id,
+        result = resolved_client.task_add(
             fields=fields,
+            method=resolved_config.add_method,
         )
     except BitrixError as exc:
         finish_task_attempt(
@@ -132,30 +137,48 @@ def deliver_candidate(
             confirmed_task_id=task_row["id"],
             request_payload=request_payload,
             response_payload=dict(result.raw_response),
-            bitrix_item_id=result.item_id,
+            bitrix_item_id=result.task_id,
             error_code=None,
             error_message=None,
         )
     return get_candidate(connection, candidate_id)
 
 
-def _json_object_env(
-    name: str,
-    default: dict[str, Any],
-) -> dict[str, Any]:
-    raw = os.getenv(name)
-    if raw is None:
-        return dict(default)
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{name} must be valid JSON") from exc
-    if not isinstance(decoded, dict):
-        raise RuntimeError(f"{name} must be a JSON object")
-    return decoded
+def _task_description(task_row: dict) -> str:
+    details = [
+        f"Подразделение: {task_row['department']}",
+        f"Источник: звонок {task_row['call_id']}",
+    ]
+    description = task_row["description"].strip()
+    if description:
+        return f"{description}\n\n" + "\n".join(details)
+    return "\n".join(details)
+
+
+def _bitrix_priority(priority: int) -> str:
+    if priority <= 2:
+        return "0"
+    if priority == 3:
+        return "1"
+    return "2"
+
+
+def _require_concrete_complaint(candidate: TaskCandidateDto) -> None:
+    if (
+        not candidate.should_create
+        or candidate.complaint_basis != "explicit_complaint"
+        or candidate.is_concrete_complaint is not True
+        or not candidate.complaint_subject.strip()
+        or not candidate.complaint_issue.strip()
+    ):
+        raise ConflictError(
+            "Bitrix task requires a concrete customer complaint with a "
+            "specific subject and issue"
+        )
 
 
 __all__ = [
     "TaskDeliveryConfig",
+    "_require_concrete_complaint",
     "deliver_candidate",
 ]

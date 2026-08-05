@@ -6,7 +6,7 @@ import json
 import os
 import re
 import ssl
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -14,10 +14,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from backend.task_create import ConfirmedTask
-
-
-TaskValueEncoder = Callable[[Any], Any]
 Transport = Callable[[str, Mapping[str, Any], float], Mapping[str, Any]]
 _METHOD_NAME = re.compile(r"^[a-z][a-z0-9_.]*$", re.IGNORECASE)
 
@@ -43,94 +39,9 @@ class BitrixAPIError(BitrixError):
 
 
 @dataclass(frozen=True, slots=True)
-class BitrixTaskMapper:
-    """Map our stable task fields to portal-specific Bitrix field codes.
-
-    Example::
-
-        BitrixTaskMapper({
-            "title": "title",
-            "description": "ufCrm42Description",
-            "department": "ufCrm42Department",
-            "initiator": "assignedById",
-            "priority": "ufCrm42Priority",
-            "source_call_id": "ufCrm42CallId",
-        })
-
-    ``value_encoders`` can translate our values to Bitrix enum/user values
-    without leaking those details into :class:`ConfirmedTask`.
-    """
-
-    field_mapping: Mapping[str, str]
-    value_encoders: Mapping[str, TaskValueEncoder] = field(default_factory=dict)
-    constant_fields: Mapping[str, Any] = field(default_factory=dict)
-
-    _SUPPORTED_FIELDS = frozenset(
-        {
-            "source_call_id",
-            "title",
-            "description",
-            "department",
-            "initiator",
-            "priority",
-        }
-    )
-
-    def __post_init__(self) -> None:
-        mapping = dict(self.field_mapping)
-        encoders = dict(self.value_encoders)
-        constant_fields = dict(self.constant_fields)
-        if not mapping:
-            raise ValueError("field_mapping cannot be empty")
-
-        unknown = set(mapping) - self._SUPPORTED_FIELDS
-        if unknown:
-            raise ValueError(f"Unknown internal task fields: {sorted(unknown)}")
-        unknown_encoders = set(encoders) - set(mapping)
-        if unknown_encoders:
-            raise ValueError(
-                "Value encoders have no matching field mapping: "
-                f"{sorted(unknown_encoders)}"
-            )
-
-        bitrix_fields = list(mapping.values())
-        if any(not isinstance(name, str) or not name.strip() for name in bitrix_fields):
-            raise ValueError("Bitrix field codes must be non-empty strings")
-        if len(bitrix_fields) != len(set(bitrix_fields)):
-            raise ValueError("Each internal field must map to a distinct Bitrix field")
-        collisions = set(bitrix_fields) & set(constant_fields)
-        if collisions:
-            raise ValueError(
-                "Constant fields collide with mapped fields: "
-                f"{sorted(collisions)}"
-            )
-        if any(
-            not isinstance(name, str) or not name.strip()
-            for name in constant_fields
-        ):
-            raise ValueError("Constant Bitrix field codes must be non-empty strings")
-
-        object.__setattr__(self, "field_mapping", mapping)
-        object.__setattr__(self, "value_encoders", encoders)
-        object.__setattr__(self, "constant_fields", constant_fields)
-
-    def to_bitrix_fields(self, task: ConfirmedTask) -> dict[str, Any]:
-        """Convert a confirmed task to ``crm.item.add`` fields."""
-
-        result: dict[str, Any] = dict(self.constant_fields)
-        for internal_name, bitrix_name in self.field_mapping.items():
-            value = getattr(task, internal_name)
-            if value is None:
-                continue
-            encoder = self.value_encoders.get(internal_name)
-            result[bitrix_name] = encoder(value) if encoder else value
-        return result
-
-
-@dataclass(frozen=True, slots=True)
-class CrmItemAddResult:
-    item_id: str | int
-    item: Mapping[str, Any]
+class TaskAddResult:
+    task_id: str | int
+    task: Mapping[str, Any]
     raw_response: Mapping[str, Any]
 
 
@@ -265,37 +176,42 @@ class BitrixClient:
             f"{method} exceeded pagination safety limit ({max_pages} pages)"
         )
 
-    def crm_item_add(
-        self, *, entity_type_id: int, fields: Mapping[str, Any]
-    ) -> CrmItemAddResult:
-        """Call Bitrix ``crm.item.add`` with already mapped fields.
+    def tasks_task_add(self, *, fields: Mapping[str, Any]) -> TaskAddResult:
+        """Create a native Bitrix task without retrying the write."""
 
-        The method intentionally does not retry: retrying a timed-out create
-        without an idempotency strategy can create duplicate CRM items.
-        """
-
-        if isinstance(entity_type_id, bool) or not isinstance(entity_type_id, int):
-            raise TypeError("entity_type_id must be an integer")
-        if entity_type_id <= 0:
-            raise ValueError("entity_type_id must be positive")
         if not fields:
             raise ValueError("fields cannot be empty")
+        response = self.call("tasks.task.add", {"fields": dict(fields)})
+        return _parse_task_add_result(response.raw_response)
 
-        payload = {"entityTypeId": entity_type_id, "fields": dict(fields)}
-        response = self.call("crm.item.add", payload)
-        return _parse_add_result(response.raw_response)
+    def task_item_add(self, *, fields: Mapping[str, Any]) -> TaskAddResult:
+        """Create a native task through the legacy method exposed on-premise."""
 
-    def create_task(
+        if not fields:
+            raise ValueError("fields cannot be empty")
+        response = self.call("task.item.add", {"fields": dict(fields)})
+        task_id = response.result
+        if isinstance(task_id, Mapping):
+            task_id = task_id.get("id") or task_id.get("ID")
+        if task_id is None or task_id == "":
+            raise BitrixTransportError("Bitrix response has no created task id")
+        return TaskAddResult(
+            task_id=task_id,
+            task={"id": task_id},
+            raw_response=dict(response.raw_response),
+        )
+
+    def task_add(
         self,
-        task: ConfirmedTask,
         *,
-        entity_type_id: int,
-        mapper: BitrixTaskMapper,
-    ) -> CrmItemAddResult:
-        """Map our entity and pass it to the separate generic add method."""
-
-        fields = mapper.to_bitrix_fields(task)
-        return self.crm_item_add(entity_type_id=entity_type_id, fields=fields)
+        fields: Mapping[str, Any],
+        method: str,
+    ) -> TaskAddResult:
+        if method == "tasks.task.add":
+            return self.tasks_task_add(fields=fields)
+        if method == "task.item.add":
+            return self.task_item_add(fields=fields)
+        raise ValueError(f"Unsupported Bitrix task add method: {method}")
 
     def download_disk_file(
         self,
@@ -467,24 +383,26 @@ def _secret_value(name: str) -> str | None:
     return os.getenv(name)
 
 
-def _parse_add_result(response: Mapping[str, Any]) -> CrmItemAddResult:
+def _parse_task_add_result(response: Mapping[str, Any]) -> TaskAddResult:
     _raise_api_error(response)
-
     result = response.get("result")
     if not isinstance(result, Mapping):
-        raise BitrixTransportError("Bitrix response has no result object")
+        raise BitrixTransportError("Bitrix task response has no result object")
 
-    item_value = result.get("item")
-    if isinstance(item_value, Mapping):
-        item = dict(item_value)
-        item_id = item.get("id")
+    task_value = result.get("task")
+    if isinstance(task_value, Mapping):
+        task = dict(task_value)
+        task_id = task.get("id") or task.get("ID")
     else:
-        item = {"id": result.get("id")}
-        item_id = item["id"]
-
-    if item_id is None or item_id == "":
-        raise BitrixTransportError("Bitrix response has no created item id")
-    return CrmItemAddResult(item_id=item_id, item=item, raw_response=dict(response))
+        task = {}
+        task_id = result.get("id") or result.get("ID")
+    if task_id is None or task_id == "":
+        raise BitrixTransportError("Bitrix response has no created task id")
+    return TaskAddResult(
+        task_id=task_id,
+        task=task,
+        raw_response=dict(response),
+    )
 
 
 def _optional_string(value: Any) -> str | None:
@@ -515,8 +433,7 @@ __all__ = [
     "BitrixAPIError",
     "BitrixClient",
     "BitrixError",
-    "BitrixTaskMapper",
     "BitrixTransportError",
     "BitrixResponse",
-    "CrmItemAddResult",
+    "TaskAddResult",
 ]

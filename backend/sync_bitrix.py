@@ -108,6 +108,17 @@ def sync_directory(
                 ),
             )
 
+        current_department_ids = [department.id for department in departments]
+        connection.execute(
+            """
+            UPDATE departments
+            SET active = false, synced_at = now()
+            WHERE active
+              AND NOT (bitrix_department_id = ANY(%s))
+            """,
+            (current_department_ids,),
+        )
+
         current_user_ids: list[int] = []
         supervisor_count = 0
         for user in scoped_users:

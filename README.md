@@ -6,52 +6,45 @@ be written to Bitrix:
 1. `AnalyzeText.analyze()` returns an immutable `TaskCandidate`.
 2. The operator either creates a separate `ConfirmedTask` (with edits) or a
    `RejectedTaskCandidate`.
-3. `BitrixTaskMapper` translates only the confirmed entity to field codes used
-   by the target Bitrix portal.
-4. `BitrixClient.create_task()` delegates the actual write to the generic
-   `crm_item_add()` method.
+3. The selected department is resolved against the synchronized Bitrix
+   structure; its head (or the nearest parent head) becomes responsible.
+4. `BitrixClient.task_add()` creates a native Bitrix task through the method
+   exposed by the portal. The operator who confirmed it becomes an observer.
 
 ```python
-from backend.task_create import ConfirmedTask
-from bitrix import BitrixClient, BitrixTaskMapper
+from bitrix import BitrixClient
 
-confirmed = ConfirmedTask.from_candidate(
-    candidate,
-    title=form.title,
-    description=form.description,
-    department=form.department,
-    initiator=form.initiator,
-    priority=form.priority,
-)
-
-mapper = BitrixTaskMapper(
-    {
-        "title": "title",
-        "description": "ufCrm42Description",
-        "department": "ufCrm42Department",
-        "initiator": "assignedById",
-        "priority": "ufCrm42Priority",
-        "source_call_id": "ufCrm42CallId",
-    }
-)
-
-result = BitrixClient(BITRIX_WEBHOOK_URL).create_task(
-    confirmed,
-    entity_type_id=142,
-    mapper=mapper,
+result = BitrixClient(BITRIX_WEBHOOK_URL).task_add(
+    fields={
+        "TITLE": "Разобрать обращение клиента",
+        "DESCRIPTION": "Контекст звонка и выбранное подразделение",
+        "RESPONSIBLE_ID": 9,
+        "AUDITORS": [10],
+        "PRIORITY": "2",
+    },
+    method="task.item.add",
 )
 ```
 
-The field codes and `entity_type_id` above are examples. They must come from
-the concrete Bitrix smart process configuration. Values such as department
-names or priority numbers can be converted to Bitrix enum IDs through the
-mapper's `value_encoders`.
+The incoming webhook needs the legacy Bitrix task scope `task` in addition to
+the read scopes used by directory, telephony, and Disk synchronization.
 
 The task-extraction model is configured through `OPENAI_TASK_MODEL`; the
 default is `gpt-5.6-luna`. Recorded calls are transcribed with
 `OPENAI_TRANSCRIPTION_MODEL` (`gpt-4o-mini-transcribe` by default). The
-production `analysis` service downloads one recent Bitrix Disk recording,
-transcribes it, creates the immutable prediction, and stores both atomically.
+raw ASR result is preserved, while `OPENAI_TRANSCRIPT_ENHANCEMENT_MODEL`
+restores punctuation, paragraphs, natural phrasing, and confidently identified
+speakers. Readability is preferred over verbatim fidelity; the raw ASR text is
+retained for audit. If that optional pass fails, analysis continues with the
+raw transcript. The production `analysis` service downloads one recent
+Bitrix Disk recording, transcribes it, creates the immutable prediction, and
+stores the result atomically.
+
+Task creation uses a strict concrete-complaint gate. The customer must state a
+specific complaint subject and a specific defect, failure, incorrect action,
+or negative incident. Vague negative feedback, questions, requests, and facts
+inferred only from the operator's words are stored with `should_create=false`,
+are omitted from the task queue, and are rejected by the delivery API.
 It automatically selects only users listed in
 `ANALYSIS_AUTO_BITRIX_USER_IDS`; every other call enters the queue only after a
 user presses the frontend analysis button. It is rate-limited by
@@ -124,8 +117,8 @@ backend transcript
 immutable task candidate
         ↓ operator confirms/edits or rejects
 confirmed task
-        ↓ portal-specific mapper
-crm.item.add + attempt audit
+        ↓ department head routing
+task.item.add / tasks.task.add + attempt audit
 ```
 
 `backend.analysis_store.persist_call_analysis()` is the worker boundary that
@@ -148,18 +141,19 @@ local delivery history; a minimal statistic-ID tombstone prevents the Bitrix
 sync worker from importing that call again. An already-created Bitrix task is
 not deleted from Bitrix.
 
-Bitrix smart-process fields stay configuration, not domain fields:
+When no department is selected, tasks route to the head of the configured
+default department:
 
 ```powershell
-$env:BITRIX_TASK_ENTITY_TYPE_ID = "1034"
-$env:BITRIX_TASK_FIELD_MAPPING = '{"title":"title"}'
-$env:BITRIX_TASK_CONSTANT_FIELDS = '{"opened":true}'
+$env:BITRIX_TASK_DEFAULT_DEPARTMENT_ID = "82"
+$env:BITRIX_TASK_ADD_METHOD = "task.item.add"
 ```
 
-Add portal-specific custom fields to the JSON mapping when they are finalized,
-for example `description`, `department`, `initiator`, `priority`, and
-`source_call_id`. The complete webhook URL is a backend-only secret and must
-not be committed or sent to the browser.
+The current on-premise portal exposes `task.item.add`; installations exposing
+the newer method can set `BITRIX_TASK_ADD_METHOD=tasks.task.add`.
+
+The complete webhook URL is a backend-only secret and must not be committed or
+sent to the browser.
 
 ## Docker: one origin for frontend and backend
 

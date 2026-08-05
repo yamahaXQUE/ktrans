@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 from pathlib import Path
 from typing import Any, Optional
@@ -18,15 +19,52 @@ from backend.task_policy import ComplaintBasis, TaskType, render_task_policy
 PROMPT_PATH = Path(__file__).parent / "prompt" / "structuredprompt.json"
 DEFAULT_TASK_MODEL = "gpt-5.6-luna"
 DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_TRANSCRIPT_ENHANCEMENT_MODEL = DEFAULT_TASK_MODEL
 TRANSCRIPTION_PROMPT = (
     "Телефонный разговор контакт-центра KULIKOV. "
     "Сохраняй исходный язык разговора (русский или кыргызский), имена, "
     "номера заказов, сроки и конкретные обязательства без выдумывания."
 )
+TRANSCRIPT_ENHANCEMENT_PROMPT = """
+Ты — редактор автоматической расшифровки телефонного разговора контакт-центра
+KULIKOV. Преврати сырой ASR-текст в связный, естественный и удобный для чтения
+диалог. Читаемость и цельность важнее дословности.
+
+Правила:
+- сохрани исходный язык каждой реплики (русский или кыргызский);
+- восстанови пунктуацию, регистр, абзацы и очевидные границы реплик;
+- добавляй метки «Оператор:» и «Клиент:» только когда роль говорящего можно
+  уверенно определить из самого текста; иначе разделяй речь абзацами без меток;
+- исправляй очевидные ошибки распознавания по контексту, выстраивай естественные
+  предложения и при необходимости слегка переформулируй сбивчивую речь;
+- сохраняй общий смысл разговора, основные имена, заказы, жалобы, договорённости
+  и обязательства, но не обязан воспроизводить каждое слово дословно;
+- убирай слова-паразиты, дубли, оговорки и незавершённые повторы;
+- не смягчай ругань, если она важна для смысла разговора;
+- если фрагмент невозможно разумно восстановить, используй «[неразборчиво]»;
+- не добавляй заголовок, резюме, выводы, комментарии редактора или новые факты.
+
+Верни весь разговор целиком в поле transcript.
+""".strip()
 
 
 class TaskAnalysisError(RuntimeError):
     """Raised when the model did not return a usable task prediction."""
+
+
+class TranscriptEnhancementError(RuntimeError):
+    """Raised when the model did not return a readable transcript."""
+
+
+class _ReadableTranscript(BaseModel):
+    transcript: str = Field(
+        min_length=1,
+        description=(
+            "The complete, coherent, human-readable edited transcript. It may "
+            "lightly rephrase ASR errors but must not replace the conversation "
+            "with a summary."
+        ),
+    )
 
 
 class _TaskCandidatePrediction(BaseModel):
@@ -58,6 +96,27 @@ class _TaskCandidatePrediction(BaseModel):
             "empty for none."
         ),
     )
+    is_concrete_complaint: bool = Field(
+        description=(
+            "True only when the customer describes both a specific subject and "
+            "a specific failure, defect, or negative incident."
+        )
+    )
+    complaint_subject: str = Field(
+        max_length=250,
+        description=(
+            "The specific product, order, payment, app function, location, "
+            "service, or operator behavior complained about; empty when the "
+            "complaint is not concrete."
+        ),
+    )
+    complaint_issue: str = Field(
+        max_length=500,
+        description=(
+            "The specific failure, defect, incorrect action, or negative incident; "
+            "empty when the complaint is not concrete."
+        ),
+    )
     requires_unstated_exact_data: bool = Field(
         description=(
             "True when an actionable task would require exact facts absent from "
@@ -87,6 +146,27 @@ class _TaskCandidatePrediction(BaseModel):
 
     @model_validator(mode="after")
     def validate_closed_policy(self) -> "_TaskCandidatePrediction":
+        subject = self.complaint_subject.strip()
+        issue = self.complaint_issue.strip()
+        if self.decision_basis == "none":
+            if self.is_concrete_complaint or subject or issue:
+                raise ValueError(
+                    "decision_basis=none cannot contain a concrete complaint"
+                )
+        elif self.is_concrete_complaint:
+            if self.decision_basis != "explicit_complaint":
+                raise ValueError(
+                    "a concrete complaint requires decision_basis=explicit_complaint"
+                )
+            if not subject or not issue:
+                raise ValueError(
+                    "a concrete complaint requires a specific subject and issue"
+                )
+        elif subject or issue:
+            raise ValueError(
+                "non-concrete feedback requires empty complaint subject and issue"
+            )
+
         if self.task_type == "none":
             if self.should_create:
                 raise ValueError("task_type=none requires should_create=false")
@@ -111,9 +191,15 @@ class _TaskCandidatePrediction(BaseModel):
 
         if not self.should_create:
             raise ValueError("approved task_type requires should_create=true")
-        if self.decision_basis == "none":
+        if self.decision_basis != "explicit_complaint":
             raise ValueError(
-                "a task requires an explicit complaint or negative feedback"
+                "a task requires an explicit concrete complaint"
+            )
+        if not self.is_concrete_complaint:
+            raise ValueError("a task requires a concrete complaint")
+        if not subject or not issue:
+            raise ValueError(
+                "a task requires a specific complaint subject and issue"
             )
         if not self.complaint_evidence.strip():
             raise ValueError("a task requires complaint evidence")
@@ -185,6 +271,51 @@ class AnalyzeCall:
         return f"AnalyzeCall(file_path={self.file_path!s})"
 
 
+class EnhanceTranscript:
+    """Make an ASR transcript readable without changing its meaning."""
+
+    def __init__(
+        self,
+        text: str,
+        client: Optional[OpenAI] = None,
+        *,
+        model: str | None = None,
+    ):
+        self.text = text
+        self.client = client or _openai_client()
+        self.model = model or os.getenv(
+            "OPENAI_TRANSCRIPT_ENHANCEMENT_MODEL",
+            os.getenv("OPENAI_TASK_MODEL", DEFAULT_TRANSCRIPT_ENHANCEMENT_MODEL),
+        )
+
+    def enhance(self) -> str:
+        """Return the full transcript with readability-only edits."""
+
+        source = self.text.strip()
+        if not source:
+            raise ValueError("transcript cannot be empty")
+
+        response = self.client.responses.parse(
+            model=self.model,
+            reasoning={"effort": "none"},
+            store=False,
+            input=[
+                {"role": "system", "content": TRANSCRIPT_ENHANCEMENT_PROMPT},
+                {"role": "user", "content": source},
+            ],
+            text_format=_ReadableTranscript,
+        )
+        readable = _extract_readable_transcript(response).transcript.strip()
+        if not readable:
+            raise TranscriptEnhancementError(
+                "Model returned an empty readable transcript"
+            )
+        return readable
+
+    def __repr__(self) -> str:
+        return f"EnhanceTranscript(text_length={len(self.text)})"
+
+
 class AnalyzeText:
     """Extract a typed task prediction from a call transcript."""
 
@@ -227,6 +358,26 @@ class AnalyzeText:
         )
         prediction = _extract_prediction(response)
 
+        if not _prediction_is_grounded(prediction, self.text):
+            return TaskCandidate(
+                call_id=resolved_call_id,
+                conversation_title=prediction.conversation_title,
+                task_name="",
+                task_description="",
+                department=None,
+                initiator=self.initiator if initiator is None else initiator,
+                priority=1,
+                should_create=False,
+                task_type="none",
+                quality_criterion=None,
+                complaint_basis="none",
+                complaint_evidence="",
+                is_concrete_complaint=False,
+                complaint_subject="",
+                complaint_issue="",
+                requires_unstated_exact_data=False,
+            )
+
         return TaskCandidate(
             call_id=resolved_call_id,
             conversation_title=prediction.conversation_title,
@@ -240,6 +391,9 @@ class AnalyzeText:
             quality_criterion=prediction.quality_criterion,
             complaint_basis=prediction.decision_basis,
             complaint_evidence=prediction.complaint_evidence,
+            is_concrete_complaint=prediction.is_concrete_complaint,
+            complaint_subject=prediction.complaint_subject,
+            complaint_issue=prediction.complaint_issue,
             requires_unstated_exact_data=prediction.requires_unstated_exact_data,
         )
 
@@ -306,6 +460,53 @@ def _extract_prediction(response: Any) -> _TaskCandidatePrediction:
     raise TaskAnalysisError(f"Model returned no task prediction{detail}")
 
 
+def _extract_readable_transcript(response: Any) -> _ReadableTranscript:
+    parsed = getattr(response, "output_parsed", None)
+    if parsed is not None:
+        return _ReadableTranscript.model_validate(parsed)
+
+    refusals: list[str] = []
+    for output in getattr(response, "output", []):
+        for content in getattr(output, "content", []):
+            refusal = getattr(content, "refusal", None)
+            if refusal:
+                refusals.append(str(refusal))
+
+    detail = f": {'; '.join(refusals)}" if refusals else ""
+    raise TranscriptEnhancementError(
+        f"Model returned no readable transcript{detail}"
+    )
+
+
+def _prediction_is_grounded(
+    prediction: _TaskCandidatePrediction,
+    transcript: str,
+) -> bool:
+    """Require complaint facts to be literal spans from the transcript."""
+
+    normalized_transcript = _normalize_grounding_text(transcript)
+    if prediction.decision_basis != "none":
+        if not _is_grounded_span(
+            prediction.complaint_evidence,
+            normalized_transcript,
+        ):
+            return False
+    if prediction.is_concrete_complaint:
+        for value in (prediction.complaint_subject, prediction.complaint_issue):
+            if not _is_grounded_span(value, normalized_transcript):
+                return False
+    return True
+
+
+def _is_grounded_span(value: str, normalized_transcript: str) -> bool:
+    normalized_value = _normalize_grounding_text(value)
+    return bool(normalized_value) and normalized_value in normalized_transcript
+
+
+def _normalize_grounding_text(value: str) -> str:
+    return " ".join(re.findall(r"[\w]+", value.casefold(), flags=re.UNICODE))
+
+
 # Compatibility aliases for code written against the prototype.
 analyzee_call = AnalyzeCall
 analyzee_text = AnalyzeText
@@ -314,9 +515,12 @@ analyzee_text = AnalyzeText
 __all__ = [
     "AnalyzeCall",
     "AnalyzeText",
+    "EnhanceTranscript",
     "DEFAULT_TASK_MODEL",
+    "DEFAULT_TRANSCRIPT_ENHANCEMENT_MODEL",
     "DEFAULT_TRANSCRIPTION_MODEL",
     "TaskAnalysisError",
+    "TranscriptEnhancementError",
     "TaskCandidate",
     "analyzee_call",
     "analyzee_text",

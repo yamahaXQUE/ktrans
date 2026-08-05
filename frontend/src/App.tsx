@@ -39,7 +39,6 @@ import type {
   UserRole,
 } from "./types/domain";
 import { normalizeText } from "./utils/format";
-import { PixelCat } from "./components/common/PixelCat";
 import { EmptyState } from "./components/common/EmptyState";
 import { LoadingState } from "./components/common/LoadingState";
 import { CandidateCard } from "./components/operator/CandidateCard";
@@ -123,10 +122,11 @@ export default function App() {
         setMockMode(getApiMode() === "mock");
         setSession(user ?? mockSessionUser());
       })
-      .catch(() => {
+      .catch((err: Error) => {
         if (active) {
-          setSession(mockSessionUser());
-          setMockMode(getApiMode() === "mock");
+          setSession(null);
+          setMockMode(false);
+          setError(err.message);
         }
       })
       .finally(() => {
@@ -604,8 +604,16 @@ export default function App() {
     }
   }
 
-  if (resolving || !effectiveUser) {
+  if (resolving) {
     return <main className="boot">Определяю пользователя…</main>;
+  }
+
+  if (!effectiveUser) {
+    return (
+      <main className="boot">
+        {error ?? "Не удалось авторизоваться через Bitrix24"}
+      </main>
+    );
   }
 
   const hasLocalFilters =
@@ -752,8 +760,6 @@ export default function App() {
               </button>
             </>
           )}
-
-          <PixelCat />
         </nav>
 
         <section className="content">

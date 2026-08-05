@@ -18,7 +18,7 @@ from fastapi import (
 )
 from psycopg import Connection
 
-from backend.bitrix_auth import validate_current_user
+from backend.bitrix_auth import validate_current_user_profile
 from backend.analytics_export import build_complaints_workbook
 from backend.db import connect
 from backend.repository import (
@@ -40,6 +40,7 @@ from backend.repository import (
     list_operator_summaries,
     reject_candidate,
     request_call_analysis,
+    upsert_bypass_supervisor,
 )
 from backend.schemas import (
     BitrixSessionPayload,
@@ -100,11 +101,21 @@ def open_bitrix_session(
     connection: Connection = Depends(connection_dependency),
 ) -> SessionDto:
     try:
-        bitrix_user_id = validate_current_user(
+        profile = validate_current_user_profile(
             domain=payload.auth.domain,
             access_token=payload.auth.access_token,
         )
-        user = get_operator_by_bitrix_user_id(connection, bitrix_user_id)
+        try:
+            user = get_operator_by_bitrix_user_id(connection, profile.id)
+        except NotFoundError:
+            if profile.id not in _access_bypass_user_ids():
+                raise
+            user = upsert_bypass_supervisor(
+                connection,
+                bitrix_user_id=profile.id,
+                display_name=profile.display_name,
+                work_position=profile.work_position or "Служебный просмотр",
+            )
     except (ValueError, BitrixError, NotFoundError) as exc:
         raise _unauthorized(str(exc)) from exc
 
@@ -371,6 +382,27 @@ def _require_supervisor(user: SessionUserDto) -> None:
 def _require_emulation() -> None:
     if not _boolean_env("BITRIX_EMULATION_ENABLED", default=False):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+
+def _access_bypass_user_ids() -> frozenset[int]:
+    raw = os.getenv("BITRIX_ACCESS_BYPASS_USER_IDS", "")
+    result: set[int] = set()
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            user_id = int(candidate)
+        except ValueError as exc:
+            raise RuntimeError(
+                "BITRIX_ACCESS_BYPASS_USER_IDS must contain positive integers"
+            ) from exc
+        if user_id <= 0:
+            raise RuntimeError(
+                "BITRIX_ACCESS_BYPASS_USER_IDS must contain positive integers"
+            )
+        result.add(user_id)
+    return frozenset(result)
 
 
 def _set_session_cookie(response: Response, session_id: UUID) -> None:

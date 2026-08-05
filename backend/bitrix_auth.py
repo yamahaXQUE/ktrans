@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from bitrix import BitrixClient, BitrixTransportError
@@ -12,12 +13,32 @@ from bitrix import BitrixClient, BitrixTransportError
 DEFAULT_BITRIX_PORTAL = "bitrix.kulikov.com"
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedBitrixUser:
+    id: int
+    display_name: str
+    work_position: str
+
+
 def validate_current_user(
     *,
     domain: str,
     access_token: str,
 ) -> int:
     """Return the authenticated Bitrix user ID after a server-side REST call."""
+
+    return validate_current_user_profile(
+        domain=domain,
+        access_token=access_token,
+    ).id
+
+
+def validate_current_user_profile(
+    *,
+    domain: str,
+    access_token: str,
+) -> ValidatedBitrixUser:
+    """Return trusted current-user fields from the allowed Bitrix portal."""
 
     host = _allowed_host(domain)
     client = BitrixClient(
@@ -39,7 +60,16 @@ def validate_current_user(
         ) from exc
     if user_id <= 0:
         raise BitrixTransportError("user.current returned an invalid user ID")
-    return user_id
+    display_name = " ".join(
+        part
+        for key in ("NAME", "SECOND_NAME", "LAST_NAME")
+        if (part := str(result.get(key) or "").strip())
+    )
+    return ValidatedBitrixUser(
+        id=user_id,
+        display_name=display_name or f"Bitrix user {user_id}",
+        work_position=str(result.get("WORK_POSITION") or "").strip(),
+    )
 
 
 def _allowed_host(domain: str) -> str:
@@ -81,4 +111,8 @@ def _tls_compatibility() -> bool:
     return value in {"true", "1", "yes"}
 
 
-__all__ = ["validate_current_user"]
+__all__ = [
+    "ValidatedBitrixUser",
+    "validate_current_user",
+    "validate_current_user_profile",
+]

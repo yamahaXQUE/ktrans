@@ -2,14 +2,15 @@ from types import SimpleNamespace
 from datetime import datetime, timezone
 import unittest
 
-from backend.analyzer import AnalyzeText
+from backend.analysis_daemon import _enhance_with_fallback
+from backend.analyzer import AnalyzeText, EnhanceTranscript
 from backend.task_create import (
     ConfirmedTask,
     RejectedTaskCandidate,
     TaskCandidate,
     task_cand,
 )
-from bitrix.bit import BitrixAPIError, BitrixClient, BitrixTaskMapper
+from bitrix.bit import BitrixAPIError, BitrixClient
 from bitrix.mirror import BitrixMirror
 
 
@@ -81,8 +82,11 @@ class AnalyzerTests(unittest.TestCase):
                         "should_create": True,
                         "decision_basis": "explicit_complaint",
                         "complaint_evidence": (
-                            "Клиент явно пожаловался на обслуживание."
+                            "Клиент явно пожаловался на обслуживание в магазине."
                         ),
+                        "is_concrete_complaint": True,
+                        "complaint_subject": "обслуживание в магазине",
+                        "complaint_issue": "меня обслужили ненадлежащим образом",
                         "requires_unstated_exact_data": False,
                         "task_type": "service_fm",
                         "quality_criterion": None,
@@ -95,7 +99,10 @@ class AnalyzerTests(unittest.TestCase):
 
         client = SimpleNamespace(responses=FakeResponses())
         candidate = AnalyzeText(
-            "Клиент явно пожаловался на обслуживание и попросил разобраться.",
+            (
+                "Клиент явно пожаловался на обслуживание в магазине. "
+                "Меня обслужили ненадлежащим образом."
+            ),
             client=client,
             call_id=55,
             initiator=9,
@@ -106,6 +113,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(candidate.conversation_title, "Жалоба на обслуживание")
         self.assertEqual(candidate.task_name, "Подготовить смету")
         self.assertTrue(candidate.should_create)
+        self.assertTrue(candidate.is_concrete_complaint)
+        self.assertEqual(candidate.complaint_subject, "обслуживание в магазине")
         self.assertEqual(candidate.task_type, "service_fm")
         self.assertEqual(parse_calls[0]["model"], "test-model")
         self.assertEqual(parse_calls[0]["reasoning"], {"effort": "none"})
@@ -141,6 +150,64 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(calls[0]["model"], "test-transcribe")
         self.assertIn("KULIKOV", calls[0]["prompt"])
 
+    def test_transcript_enhancer_uses_structured_private_response(self):
+        calls = []
+
+        class FakeResponses:
+            def parse(self, **kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    output_parsed={
+                        "transcript": (
+                            "Оператор: Добрый день.\n\n"
+                            "Клиент: Заказ 123 всё ещё не доставили."
+                        )
+                    }
+                )
+
+        readable = EnhanceTranscript(
+            "добрый день заказ 123 всё ещё не доставили",
+            client=SimpleNamespace(responses=FakeResponses()),
+            model="test-enhancer",
+        ).enhance()
+
+        self.assertIn("Оператор:", readable)
+        self.assertIn("123", readable)
+        self.assertEqual(calls[0]["model"], "test-enhancer")
+        self.assertEqual(calls[0]["reasoning"], {"effort": "none"})
+        self.assertFalse(calls[0]["store"])
+        self.assertEqual(calls[0]["text_format"].__name__, "_ReadableTranscript")
+        self.assertIn("не добавляй", calls[0]["input"][0]["content"])
+
+    def test_transcript_enhancement_failure_falls_back_to_raw_text(self):
+        class FakeResponses:
+            def parse(self, **_kwargs):
+                raise RuntimeError("temporary model failure")
+
+        raw = "клиент назвал заказ 456"
+        readable, error = _enhance_with_fallback(
+            raw,
+            client=SimpleNamespace(responses=FakeResponses()),
+            model="test-enhancer",
+        )
+
+        self.assertEqual(readable, raw)
+        self.assertIn("RuntimeError", error)
+
+    def test_transcript_enhancer_prioritizes_readability_over_exact_numbers(self):
+        class FakeResponses:
+            def parse(self, **_kwargs):
+                return SimpleNamespace(
+                    output_parsed={"transcript": "Клиент назвал заказ 457."}
+                )
+
+        readable = EnhanceTranscript(
+            "клиент назвал заказ 456",
+            client=SimpleNamespace(responses=FakeResponses()),
+        ).enhance()
+
+        self.assertEqual(readable, "Клиент назвал заказ 457.")
+
     def test_analyzer_requires_none_for_calls_outside_closed_policy(self):
         class FakeResponses:
             def parse(self, **_kwargs):
@@ -150,6 +217,9 @@ class AnalyzerTests(unittest.TestCase):
                         "should_create": False,
                         "decision_basis": "none",
                         "complaint_evidence": "",
+                        "is_concrete_complaint": False,
+                        "complaint_subject": "",
+                        "complaint_issue": "",
                         "requires_unstated_exact_data": False,
                         "task_type": "none",
                         "quality_criterion": None,
@@ -171,15 +241,18 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(candidate.task_type, "none")
         self.assertEqual(candidate.task_name, "")
 
-    def test_complaint_without_model_task_remains_available_to_operator(self):
+    def test_vague_negative_feedback_does_not_create_task(self):
         class FakeResponses:
             def parse(self, **_kwargs):
                 return SimpleNamespace(
                     output_parsed={
                         "conversation_title": "Жалоба без готовой задачи",
                         "should_create": False,
-                        "decision_basis": "explicit_complaint",
+                        "decision_basis": "explicit_negative_feedback",
                         "complaint_evidence": "Клиент выразил недовольство.",
+                        "is_concrete_complaint": False,
+                        "complaint_subject": "",
+                        "complaint_issue": "",
                         "requires_unstated_exact_data": False,
                         "task_type": "none",
                         "quality_criterion": None,
@@ -197,7 +270,8 @@ class AnalyzerTests(unittest.TestCase):
         ).analyze()
 
         self.assertFalse(candidate.should_create)
-        self.assertEqual(candidate.complaint_basis, "explicit_complaint")
+        self.assertEqual(candidate.complaint_basis, "explicit_negative_feedback")
+        self.assertFalse(candidate.is_concrete_complaint)
         self.assertEqual(candidate.conversation_title, "Жалоба без готовой задачи")
 
     def test_quality_task_requires_criterion_from_document(self):
@@ -209,8 +283,11 @@ class AnalyzerTests(unittest.TestCase):
                         "should_create": True,
                         "decision_basis": "explicit_complaint",
                         "complaint_evidence": (
-                            "Клиент пожаловался на обращение «минуточку»."
+                            "оператор постоянно говорит мне «минуточку»"
                         ),
+                        "is_concrete_complaint": True,
+                        "complaint_subject": "оператор",
+                        "complaint_issue": "постоянно говорит мне «минуточку»",
                         "requires_unstated_exact_data": False,
                         "task_type": "operator_quality_violation",
                         "quality_criterion": 13,
@@ -234,6 +311,38 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(candidate.task_type, "operator_quality_violation")
         self.assertEqual(candidate.quality_criterion, 13)
 
+    def test_ungrounded_complaint_is_downgraded_to_no_task(self):
+        class FakeResponses:
+            def parse(self, **_kwargs):
+                return SimpleNamespace(
+                    output_parsed={
+                        "conversation_title": "Жалоба на продукт",
+                        "should_create": True,
+                        "decision_basis": "explicit_complaint",
+                        "complaint_evidence": "Клиент пожаловался на эклер.",
+                        "is_concrete_complaint": True,
+                        "complaint_subject": "заказ 123",
+                        "complaint_issue": "привезли другой торт",
+                        "requires_unstated_exact_data": False,
+                        "task_type": "product_quality_food_safety",
+                        "quality_criterion": None,
+                        "task_name": "Проверить продукт",
+                        "task_description": "Разобрать жалобу клиента.",
+                        "department": None,
+                        "priority": 3,
+                    }
+                )
+
+        candidate = AnalyzeText(
+            "Клиент пожаловался на эклер. Внутри была плесень.",
+            client=SimpleNamespace(responses=FakeResponses()),
+            call_id=61,
+        ).analyze()
+
+        self.assertFalse(candidate.should_create)
+        self.assertEqual(candidate.task_type, "none")
+        self.assertFalse(candidate.is_concrete_complaint)
+
     def test_plain_delivery_request_cannot_be_promoted_to_task(self):
         class FakeResponses:
             def parse(self, **_kwargs):
@@ -243,6 +352,9 @@ class AnalyzerTests(unittest.TestCase):
                         "should_create": True,
                         "decision_basis": "none",
                         "complaint_evidence": "",
+                        "is_concrete_complaint": False,
+                        "complaint_subject": "",
+                        "complaint_issue": "",
                         "requires_unstated_exact_data": False,
                         "task_type": "ice_cream",
                         "quality_criterion": None,
@@ -256,7 +368,7 @@ class AnalyzerTests(unittest.TestCase):
         client = SimpleNamespace(responses=FakeResponses())
         with self.assertRaisesRegex(
             ValueError,
-            "explicit complaint or negative feedback",
+            "explicit concrete complaint",
         ):
             AnalyzeText(
                 "Клиент оформил обычную доставку мороженого.",
@@ -273,6 +385,9 @@ class AnalyzerTests(unittest.TestCase):
                         "should_create": True,
                         "decision_basis": "explicit_complaint",
                         "complaint_evidence": "Клиент сказал, что недоволен.",
+                        "is_concrete_complaint": True,
+                        "complaint_subject": "платёж",
+                        "complaint_issue": "неизвестный платёж требует проверки",
                         "requires_unstated_exact_data": True,
                         "task_type": "payment_check",
                         "quality_criterion": None,
@@ -293,58 +408,61 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class BitrixTests(unittest.TestCase):
-    def setUp(self):
-        self.task = ConfirmedTask(
-            source_call_id="call-9",
-            title="Подготовить смету",
-            description="Отправить клиенту",
-            department="Расчётный отдел",
-            initiator=9,
-            priority=4,
-        )
-        self.mapper = BitrixTaskMapper(
-            {
-                "title": "title",
-                "description": "ufCrm42Description",
-                "department": "ufCrm42Department",
-                "initiator": "assignedById",
-                "priority": "ufCrm42Priority",
-                "source_call_id": "ufCrm42CallId",
-            },
-            value_encoders={"priority": lambda value: f"P{value}"},
-        )
-
-    def test_mapping_is_portal_specific(self):
-        fields = self.mapper.to_bitrix_fields(self.task)
-
-        self.assertEqual(fields["title"], "Подготовить смету")
-        self.assertEqual(fields["ufCrm42Priority"], "P4")
-        self.assertEqual(fields["ufCrm42CallId"], "call-9")
-
-    def test_create_task_calls_crm_item_add_with_mapped_fields(self):
+    def test_create_task_calls_native_tasks_method(self):
         calls = []
 
         def transport(url, payload, timeout):
             calls.append((url, payload, timeout))
-            return {"result": {"item": {"id": 321, **payload["fields"]}}}
+            return {"result": {"task": {"id": "321", **payload["fields"]}}}
 
         client = BitrixClient(
             "https://portal.example/rest/1/secret/",
             timeout=8,
             transport=transport,
         )
-        result = client.create_task(
-            self.task, entity_type_id=142, mapper=self.mapper
+        result = client.tasks_task_add(
+            fields={
+                "TITLE": "Подготовить смету",
+                "DESCRIPTION": "Отправить клиенту",
+                "RESPONSIBLE_ID": 9,
+                "PRIORITY": "2",
+            }
         )
 
-        self.assertEqual(result.item_id, 321)
+        self.assertEqual(result.task_id, "321")
         self.assertEqual(
             calls[0][0],
-            "https://portal.example/rest/1/secret/crm.item.add",
+            "https://portal.example/rest/1/secret/tasks.task.add",
         )
-        self.assertEqual(calls[0][1]["entityTypeId"], 142)
-        self.assertEqual(calls[0][1]["fields"]["title"], "Подготовить смету")
+        self.assertEqual(
+            calls[0][1]["fields"]["TITLE"],
+            "Подготовить смету",
+        )
+        self.assertEqual(calls[0][1]["fields"]["RESPONSIBLE_ID"], 9)
         self.assertEqual(calls[0][2], 8)
+
+    def test_onpremise_task_method_returns_scalar_id(self):
+        calls = []
+
+        def transport(url, payload, timeout):
+            calls.append((url, payload, timeout))
+            return {"result": 654}
+
+        client = BitrixClient(
+            "https://portal.example/rest/1/secret/",
+            transport=transport,
+        )
+        result = client.task_add(
+            fields={"TITLE": "Проверка", "RESPONSIBLE_ID": 9},
+            method="task.item.add",
+        )
+
+        self.assertEqual(result.task_id, 654)
+        self.assertEqual(
+            calls[0][0],
+            "https://portal.example/rest/1/secret/task.item.add",
+        )
+        self.assertEqual(calls[0][1]["fields"]["RESPONSIBLE_ID"], 9)
 
     def test_api_error_is_not_treated_as_success(self):
         client = BitrixClient(
@@ -356,7 +474,7 @@ class BitrixTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(BitrixAPIError, "Bad fields"):
-            client.crm_item_add(entity_type_id=142, fields={"title": "x"})
+            client.tasks_task_add(fields={"TITLE": "x"})
 
     def test_list_pagination_follows_next_offset(self):
         starts = []

@@ -1,10 +1,8 @@
 // Typed client for the call -> task backend.
 //
 // Every call targets the documented /api/* contract (see frontend/README.md).
-// When the backend is unreachable (standalone dev) the client transparently
-// falls back to the in-memory mock dataset, so the UI is fully interactive on
-// its own. `getApiMode()` tells the shell which mode won, so it can show the
-// dev-only role switch when running on mock data.
+// Vite development may fall back to the in-memory dataset. Production builds
+// require a real Bitrix or backend session and never impersonate a mock user.
 
 import type {
   ComplaintAnalytics,
@@ -67,10 +65,16 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
  *   3. neither -> mock, returns null and the shell uses a local user
  */
 export async function resolveSession(): Promise<SessionUser | null> {
-  const bitrixUser = await initBitrixSession();
-  if (bitrixUser) {
-    apiMode = "live";
-    return bitrixUser;
+  let sessionError: Error | null = null;
+
+  try {
+    const bitrixUser = await initBitrixSession();
+    if (bitrixUser) {
+      apiMode = "live";
+      return bitrixUser;
+    }
+  } catch (error) {
+    sessionError = error instanceof Error ? error : new Error(String(error));
   }
 
   try {
@@ -82,12 +86,17 @@ export async function resolveSession(): Promise<SessionUser | null> {
         return data.user;
       }
     }
-  } catch {
-    // backend not reachable — fall through to mock
+  } catch (error) {
+    sessionError = error instanceof Error ? error : new Error(String(error));
   }
 
-  apiMode = "mock";
-  return null;
+  if (import.meta.env.DEV) {
+    apiMode = "mock";
+    return null;
+  }
+
+  apiMode = "live";
+  throw sessionError ?? new Error("Откройте приложение из интерфейса Bitrix24");
 }
 
 /** The local user used when the app runs on mock data. */
@@ -222,14 +231,14 @@ export function getOperators(): Promise<OperatorSummary[]> {
 
 export function getComplaintAnalytics(): Promise<ComplaintAnalytics> {
   if (apiMode === "mock") {
+    const complaintCandidates = mockState().filter((candidate) =>
+      ["explicit_complaint", "explicit_negative_feedback"].includes(
+        candidate.complaintBasis,
+      ),
+    );
     const counts = new Map<string, number>();
-    for (const candidate of mockState()) {
-      if (
-        candidate.status !== "confirmed" ||
-        !["explicit_complaint", "explicit_negative_feedback"].includes(
-          candidate.complaintBasis,
-        )
-      ) {
+    for (const candidate of complaintCandidates) {
+      if (candidate.status !== "confirmed") {
         continue;
       }
       const department = candidate.department?.trim() || "Без отдела";
@@ -252,10 +261,98 @@ export function getComplaintAnalytics(): Promise<ComplaintAnalytics> {
           right.count - left.count ||
           left.department.localeCompare(right.department, "ru"),
       );
+
+    const taskTypeCounts = new Map<TaskCandidate["taskType"], number>();
+    for (const candidate of complaintCandidates) {
+      taskTypeCounts.set(
+        candidate.taskType,
+        (taskTypeCounts.get(candidate.taskType) ?? 0) + 1,
+      );
+    }
+    const taskTypes = Array.from(taskTypeCounts.entries())
+      .map(([taskType, count]) => ({
+        taskType,
+        count,
+        sharePercent: complaintCandidates.length
+          ? Math.round((count * 1000) / complaintCandidates.length) / 10
+          : 0,
+      }))
+      .sort((left, right) => right.count - left.count);
+
+    const dailyMap = new Map<
+      string,
+      ComplaintAnalytics["daily"][number]
+    >();
+    for (const call of mockCalls) {
+      const day = call.startedAt.slice(0, 10);
+      const item = dailyMap.get(day) ?? {
+        day,
+        calls: 0,
+        analyzedCalls: 0,
+        analysisFailures: 0,
+        complaintCandidates: 0,
+        createdTasks: 0,
+      };
+      item.calls += 1;
+      item.analyzedCalls += call.analysisStatus === "completed" ? 1 : 0;
+      item.analysisFailures += call.analysisStatus === "failed" ? 1 : 0;
+      const callComplaints = complaintCandidates.filter(
+        (candidate) => candidate.callId === call.id,
+      );
+      item.complaintCandidates += callComplaints.length;
+      item.createdTasks += callComplaints.filter(
+        (candidate) => candidate.status === "confirmed",
+      ).length;
+      dailyMap.set(day, item);
+    }
+    const daily = Array.from(dailyMap.values()).sort((left, right) =>
+      left.day.localeCompare(right.day),
+    );
+    const analyzedCalls = mockCalls.filter(
+      (call) => call.analysisStatus === "completed",
+    ).length;
+    const confirmedCandidates = complaintCandidates.filter((candidate) =>
+      ["confirmed", "failed"].includes(candidate.status),
+    ).length;
+    const period = mockCalls
+      .map((call) => call.startedAt)
+      .sort((left, right) => left.localeCompare(right));
+
     return Promise.resolve({
       totalComplaints,
+      totalCalls: mockCalls.length,
+      analyzedCalls,
+      analysisFailedCalls: mockCalls.filter(
+        (call) => call.analysisStatus === "failed",
+      ).length,
+      analysisPendingCalls: mockCalls.filter((call) =>
+        ["pending", "processing"].includes(call.analysisStatus),
+      ).length,
+      manualQueueCalls: mockCalls.filter(
+        (call) =>
+          call.analysisRequested &&
+          ["pending", "processing"].includes(call.analysisStatus),
+      ).length,
+      complaintCandidates: complaintCandidates.length,
+      confirmedCandidates,
+      rejectedCandidates: complaintCandidates.filter(
+        (candidate) => candidate.status === "rejected",
+      ).length,
+      deliveryFailedTasks: complaintCandidates.filter(
+        (candidate) => candidate.status === "failed",
+      ).length,
+      analysisCoveragePercent: mockCalls.length
+        ? Math.round((analyzedCalls * 1000) / mockCalls.length) / 10
+        : 0,
+      deliverySuccessPercent: confirmedCandidates
+        ? Math.round((totalComplaints * 1000) / confirmedCandidates) / 10
+        : 0,
+      periodStart: period[0] ?? null,
+      periodEnd: period.length ? period[period.length - 1] : null,
       generatedAt: nowIso(),
       departments,
+      taskTypes,
+      daily,
     });
   }
   return request<ComplaintAnalytics>("/api/analytics/complaints");

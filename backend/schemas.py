@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -87,6 +87,9 @@ class TaskCandidateDto(ApiModel):
     quality_criterion: int | None = Field(default=None, ge=1, le=20)
     complaint_basis: ComplaintBasis | Literal["legacy"]
     complaint_evidence: str
+    is_concrete_complaint: bool | None = None
+    complaint_subject: str = ""
+    complaint_issue: str = ""
     status: CandidateStatus
     bitrix_task_id: str | None
     failure_reason: str | None
@@ -114,15 +117,46 @@ class ComplaintDepartmentStatDto(ApiModel):
     share_percent: float = Field(ge=0, le=100)
 
 
+class ComplaintTaskTypeStatDto(ApiModel):
+    task_type: TaskType | Literal["legacy"]
+    count: int = Field(ge=0)
+    share_percent: float = Field(ge=0, le=100)
+
+
+class ComplaintDailyStatDto(ApiModel):
+    day: date
+    calls: int = Field(ge=0)
+    analyzed_calls: int = Field(ge=0)
+    analysis_failures: int = Field(ge=0)
+    complaint_candidates: int = Field(ge=0)
+    created_tasks: int = Field(ge=0)
+
+
 class ComplaintAnalyticsDto(ApiModel):
     total_complaints: int = Field(ge=0)
+    total_calls: int = Field(ge=0)
+    analyzed_calls: int = Field(ge=0)
+    analysis_failed_calls: int = Field(ge=0)
+    analysis_pending_calls: int = Field(ge=0)
+    manual_queue_calls: int = Field(ge=0)
+    complaint_candidates: int = Field(ge=0)
+    confirmed_candidates: int = Field(ge=0)
+    rejected_candidates: int = Field(ge=0)
+    delivery_failed_tasks: int = Field(ge=0)
+    analysis_coverage_percent: float = Field(ge=0, le=100)
+    delivery_success_percent: float = Field(ge=0, le=100)
+    period_start: datetime | None
+    period_end: datetime | None
     generated_at: datetime
     departments: list[ComplaintDepartmentStatDto]
+    task_types: list[ComplaintTaskTypeStatDto]
+    daily: list[ComplaintDailyStatDto]
 
 
 class ConfirmCandidatePayload(ApiModel):
     task_name: str = Field(min_length=1, max_length=160)
     task_description: str = Field(default="", max_length=2000)
+    department_id: int | None = Field(default=None, ge=1)
     department: str | None = Field(default=None, max_length=250)
     priority: int = Field(ge=1, le=5)
 
@@ -147,7 +181,9 @@ class BitrixSessionPayload(ApiModel):
 __all__ = [
     "BitrixSessionPayload",
     "ComplaintAnalyticsDto",
+    "ComplaintDailyStatDto",
     "ComplaintDepartmentStatDto",
+    "ComplaintTaskTypeStatDto",
     "ConfirmCandidatePayload",
     "DepartmentDto",
     "DictionariesDto",

@@ -78,6 +78,11 @@ export function CandidateCard({ candidate, onOpen, onDelete }: CandidateCardProp
             Основание: {candidate.complaintEvidence}
           </p>
         )}
+        {candidate.isConcreteComplaint && (
+          <p className="promo-summary">
+            Конкретная жалоба: {candidate.complaintSubject} — {candidate.complaintIssue}
+          </p>
+        )}
 
         {candidate.status === "failed" && candidate.failureReason && (
           <div className="candidate-alert candidate-alert-danger">

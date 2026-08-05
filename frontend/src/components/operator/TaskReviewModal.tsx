@@ -52,7 +52,14 @@ export function TaskReviewModal({
     candidate.taskName || candidate.conversationTitle,
   );
   const [taskDescription, setTaskDescription] = useState(candidate.taskDescription);
-  const [department, setDepartment] = useState(candidate.department ?? "");
+  const [departmentId, setDepartmentId] = useState<number | null>(() => {
+    const matched = departments.find(
+      (item) =>
+        item.name.toLocaleLowerCase("ru-RU") ===
+        candidate.department?.toLocaleLowerCase("ru-RU"),
+    );
+    return matched?.id ?? null;
+  });
   const [priority, setPriority] = useState<Priority>(candidate.priority);
   const [rejecting, setRejecting] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
@@ -70,16 +77,26 @@ export function TaskReviewModal({
   }, [onClose]);
 
   const payload = useMemo<ConfirmCandidatePayload>(
-    () => ({
-      taskName: taskName.trim(),
-      taskDescription: taskDescription.trim(),
-      department: department.trim() ? department.trim() : null,
-      priority,
-    }),
-    [department, priority, taskDescription, taskName],
+    () => {
+      const selectedDepartment = departments.find(
+        (item) => item.id === departmentId,
+      );
+      return {
+        taskName: taskName.trim(),
+        taskDescription: taskDescription.trim(),
+        departmentId,
+        department: selectedDepartment?.name ?? null,
+        priority,
+      };
+    },
+    [departmentId, departments, priority, taskDescription, taskName],
   );
 
-  const canSubmit = payload.taskName.length > 0 && !busy;
+  const canSubmit =
+    candidate.shouldCreate &&
+    candidate.isConcreteComplaint === true &&
+    payload.taskName.length > 0 &&
+    !busy;
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -131,9 +148,9 @@ export function TaskReviewModal({
         <div className="details-status-row">
           <StatusPill status={candidate.status} />
           <PriorityPill priority={priority} />
-          {!candidate.shouldCreate && (
+          {candidate.isConcreteComplaint !== true && (
             <span className="tag soft">
-              Модель не рекомендует задачу — решение за оператором
+              Нет конкретной жалобы — создание задачи запрещено
             </span>
           )}
           {candidate.bitrixTaskId && (
@@ -188,13 +205,17 @@ export function TaskReviewModal({
           <label>
             Подразделение
             <select
-              value={department}
+              value={departmentId ?? ""}
               disabled={!editable}
-              onChange={(event) => setDepartment(event.target.value)}
+              onChange={(event) =>
+                setDepartmentId(
+                  event.target.value ? Number(event.target.value) : null,
+                )
+              }
             >
               <option value="">Не указано</option>
               {departments.map((item) => (
-                <option key={item.id} value={item.name}>
+                <option key={item.id} value={item.id}>
                   {item.name}
                 </option>
               ))}
